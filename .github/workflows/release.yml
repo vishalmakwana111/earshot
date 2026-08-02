@@ -53,6 +53,23 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # A tag is the only thing that names a release, and nothing else forces it
+      # to agree with the crate. Without this, `git tag v0.2.0` on a tree still
+      # at 0.1.0 publishes binaries that introduce themselves as the previous
+      # version — with matching checksums, so it looks entirely legitimate.
+      - name: Tag must match the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 \
+                  | sed -n 's/.*"name":"earshot","version":"\([^"]*\)".*/\1/p')
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "tag and crate agree on $crate"
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
