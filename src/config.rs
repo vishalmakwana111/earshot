@@ -126,6 +126,27 @@ pub struct Settings {
     /// where cloud metadata services live. Naming the network you mean costs a
     /// few characters and gives up nothing else.
     pub room_allow_networks: Vec<Cidr>,
+    /// Host backend (M3): the address `earshot host` binds, e.g. `127.0.0.1:8787`.
+    pub host_bind: Option<String>,
+    /// The external engine that actually touches the Spotify session: the base
+    /// URL whose `/resolve` returns `{uri, format, key_hex, url}`. earshot
+    /// never produces the audio itself (DESIGN Part 8 #3).
+    pub host_engine: Option<String>,
+    /// PEM certificate chain served by `earshot host`. With [`Self::host_tls_key`],
+    /// turns the room's control channel and CDN into https.
+    pub host_tls_cert: Option<String>,
+    /// PEM private key for [`Self::host_tls_cert`].
+    pub host_tls_key: Option<String>,
+    /// Reach the room host over https. Must match how the host is configured;
+    /// the CDN URLs it mints carry their own scheme.
+    pub room_tls: bool,
+    /// PEM certificate to trust for the room host, instead of the public roots.
+    ///
+    /// A room on a LAN has no publicly-signed name, and the answer to that is a
+    /// certificate the guest is told to trust — not a switch that turns
+    /// verification off, which would leave the channel encrypted against a
+    /// passive listener and wide open to an active one.
+    pub room_ca_cert: Option<String>,
 }
 
 impl Default for Settings {
@@ -138,6 +159,12 @@ impl Default for Settings {
             room_host: None,
             room_token: None,
             room_allow_networks: Vec::new(),
+            host_bind: None,
+            host_engine: None,
+            host_tls_cert: None,
+            host_tls_key: None,
+            room_tls: false,
+            room_ca_cert: None,
         }
     }
 }
@@ -285,6 +312,44 @@ impl Settings {
                         .map_err(|e| format!("room_allow_networks: {e}"))?
                 };
             }
+            "host_bind" => {
+                self.host_bind = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "host_engine" => {
+                self.host_engine = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "host_tls_cert" => {
+                self.host_tls_cert = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "host_tls_key" => {
+                self.host_tls_key = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "room_tls" => {
+                self.room_tls = parse_bool("room_tls", value)?;
+            }
+            "room_ca_cert" => {
+                self.room_ca_cert = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
             other => {
                 let known: Vec<&str> = KEYS.iter().map(|(k, _)| *k).collect();
                 return Err(format!(
@@ -303,6 +368,14 @@ fn parse_secs(key: &str, value: &str) -> Result<u64, String> {
         .map_err(|_| format!("{key}: {value:?} is not a number of seconds"))
 }
 
+fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => Err(format!("{key}: {value:?} is not true or false")),
+    }
+}
+
 /// Config-file key paired with the environment variable that overrides it.
 const KEYS: &[(&str, &str)] = &[
     ("http_window", "EARSHOT_HTTP_WINDOW"),
@@ -312,6 +385,12 @@ const KEYS: &[(&str, &str)] = &[
     ("room_host", "EARSHOT_ROOM_HOST"),
     ("room_token", "EARSHOT_ROOM_TOKEN"),
     ("room_allow_networks", "EARSHOT_ROOM_ALLOW_NETWORKS"),
+    ("host_bind", "EARSHOT_HOST_BIND"),
+    ("host_engine", "EARSHOT_HOST_ENGINE"),
+    ("host_tls_cert", "EARSHOT_HOST_TLS_CERT"),
+    ("host_tls_key", "EARSHOT_HOST_TLS_KEY"),
+    ("room_tls", "EARSHOT_ROOM_TLS"),
+    ("room_ca_cert", "EARSHOT_ROOM_CA_CERT"),
 ];
 
 /// The commented template written by `earshot config --init`, so there is a file
@@ -348,6 +427,23 @@ pub const TEMPLATE: &str = "\
 # addresses cloud metadata services answer on. Comma-separated.
 # room_allow_networks = \"100.64.0.0/10\"
 
+# The host backend (M3). `host_bind` is where `earshot host` listens; the
+# engine is the external HTTP endpoint whose /resolve produces the audio+key
+# (see DESIGN Part 8 #3). Both optional — only meaningful when running `host`.
+# host_bind = \"127.0.0.1:8787\"
+# host_engine = \"http://127.0.0.1:9090\"
+
+# TLS for the room (needs the `tls` feature). Set both on the host and it
+# serves https, minting https CDN URLs; guests then need room_tls = true.
+# Without it the shared token and the audio key cross the network in the clear.
+# host_tls_cert = \"/etc/earshot/room.crt\"
+# host_tls_key = \"/etc/earshot/room.key\"
+
+# Guest side of the same. A room on a LAN has no publicly-signed name, so point
+# room_ca_cert at the certificate (or its CA) to trust; leaving it unset uses
+# the public roots. There is deliberately no \"skip verification\" switch.
+# room_tls = false
+# room_ca_cert = \"/etc/earshot/room-ca.crt\"
 ";
 
 #[cfg(test)]
@@ -456,6 +552,7 @@ mod tests {
                 "max_idle" => "off",
                 "room_host" => "127.0.0.1:8787",
                 "room_token" => "0123456789abcdef0123456789abcdef",
+                "room_tls" => "true",
                 "room_allow_networks" => "127.0.0.0/8",
                 _ => "70000",
             };

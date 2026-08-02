@@ -176,26 +176,29 @@ rather than files is worse than none.
 
 ```
 src/
-  main.rs        ✅ dispatch: <uri> | probe | pages        (host, sources: M3)
+  main.rs        ✅ dispatch: <uri> | probe | pages | config | host
   source/
-    mod.rs       ✅ trait Source + registry by scheme
+    mod.rs       ✅ trait Source + registry by scheme, OpenError
     file.rs      ✅ positioned reads
     mem.rs       ✅ in-memory, for tests
-    http.rs      ⬜ M2  ranged reader: fallback, If-Range, resume, timeouts
-    decrypt.rs   ⬜ M2  Decrypt<S>  — offset-indexed CTR
-    window.rs    ⬜ M2  Window<S>   — offset shift
+    http.rs      ✅ ranged reader: fallback, If-Range, resume, timeouts
+    decrypt.rs   ✅ Decrypt<S>  — offset-indexed CTR
+    window.rs    ✅ Window<S>   — offset shift
   ogg/
     crc.rs       ✅ the trap; own table, known-answer tested
     page.rs      ✅ parse + serialise + in-place patchers, roundtrip-exact
     scan.rs      ✅ read-at-offset, resync, granule bisection
   codec.rs       ✅ Vorbis + Opus granule semantics
   splice.rs      ✅ policy, plan/emit split, page rewriting
-  config.rs      ⬜ M2  CLI > EARSHOT_* > ~/.config/earshot/earshot.toml
+  config.rs      ✅ CLI > EARSHOT_* > ~/.config/earshot/earshot.toml
   room/
-    client.rs    ⬜ M2  protocol client, strict validation
-    host.rs      ⬜ M3  the `host` subcommand, isolated from the pipeline
-  oauth.rs       ⬜ M3  PKCE (host only)
+    client.rs    ✅ protocol client, strict validation
+    host.rs      ✅ the `host` subcommand, isolated from the pipeline
 ```
+
+`oauth.rs` (PKCE) is **not** built and is no longer planned: M3 settled the host
+as a wrapper around an external engine, so the Spotify login lives in the engine
+and earshot never holds a credential. See Part 5, M3.
 
 Two deviations from the original sketch, both deliberate:
 
@@ -293,10 +296,67 @@ would not have contained:
   granule ≥ target, not the last with granule ≤ target.
 - **`actual_start_ms` was optimistic by one block**, until A13 was measured.
 
-**M2 — `room://`.** `Decrypt` and `Window` decorators plus a strict-validation
-protocol client. Small *because* M1 gets the trait right.
+**M2 — `room://`. ✅ done.** `Decrypt` and `Window` decorators plus a strict-validation
+protocol client (`RoomClient::resolve` → validated `ResolveReply` → `Decrypt`
+with the fixed-A8 IV → Ogg-magic probe at `0xa7` → `Window`). Small *because* M1
+gets the trait right. Exits land on the M1 contract: a rejected token is auth (4),
+a resolve flake is transient (2), a non-Ogg format is unavailable (3), a bad key
+is malformed (5). Covered end to end against a fake `127.0.0.1` host that mints
+key and CDN URLs; `room_allow_private` is the only escape from the SSRF guard,
+for rooms/CDNs legitimately private.
 
-**M3 — `host` + polish.** README, docs, hardening.
+**M3 — `host`. ✅ done.** The other half of a room, and the answer to Part 8 #1:
+earshot owns the **server surface** — token, `/join`, `/resolve`, and a
+time-limited HMAC-signed ranged CDN — while an **external engine** over HTTP does
+the one thing earshot will not, namely hold a Spotify session and produce the
+encrypted file plus its key. One POST is the whole engine contract:
+
+```text
+POST <host_engine>/engine-resolve  {"uri": …}
+→ 200 {"uri", "format", "key_hex", "url"}
+```
+
+Consequences worth stating, because they are the point rather than side effects:
+
+- **No credential in earshot.** No PKCE, no librespot, no token store. The ToS
+  exposure of Part 7 lands on whoever runs the engine, and the `oauth.rs` of the
+  original sketch is deleted from the plan rather than deferred.
+- **The engine's address never reaches a guest.** `/resolve` returns URLs on the
+  *host*; `/audio/<id>` carries the engine URL base64'd inside a signature the
+  host alone can mint. A guest cannot enumerate, forge, or outlive one:
+  `sign = SHA-256(secret ‖ id ‖ "|" ‖ exp)`, `secret = SHA-256("earshot/cdn/v1" ‖ token)`.
+- **A hostile engine is treated as a hostile host.** `format`/`key_hex`/`url` from
+  the engine get the same strict validation the guest applies to a resolve reply,
+  so a compromised engine cannot push a non-Ogg body or a bad key through to
+  listeners.
+- **The advertised address comes from the listener, not the config.** A `:0` bind
+  means the OS chose the port, and a CDN URL minted from the configured string
+  would be unfetchable. A wildcard bind is refused for the same reason rather
+  than silently minting `http://0.0.0.0:…`.
+- **The host is the one concurrent thing in earshot.** The guest pipeline stays
+  single-threaded and blocking, but a room exists to serve many listeners from
+  one session, and every `/audio/` request blocks on the engine. A single accept
+  loop would queue listener N+1 behind listener N's round trip, so requests are
+  taken by a fixed pool of workers. Asserted structurally in `host_e2e`: the fake
+  engine refuses to answer until several requests are inside it at once, which a
+  serialized host can never arrange.
+- **The host does not pool its connections to the engine**, which concurrency
+  turned from a micro-optimisation into a correctness bug. Found by driving the
+  real binaries: an engine that closes per response leaves the idle pool full of
+  dead sockets, the close is discovered only when the next request goes out on
+  one, and the resulting 502 reaches the guest as `exit 5 — not a Spotify Ogg
+  file`. That is the worst possible symptom, because it accuses the key. Retries
+  do not converge either — when every pooled connection is stale, each attempt
+  draws another corpse (measured: 7 failures per 40 concurrent plays, still 1 per
+  80 with four attempts, 0 unpooled). The guest keeps its pool, where a distant
+  CDN makes keep-alive pay; the host is deployed beside its engine, so a fresh
+  loopback connection per megabyte costs nothing. The retry stays for genuinely
+  transient failures, such as an engine restarting mid-stream.
+
+Covered end to end in `tests/host_e2e.rs` — a real `earshot host` subprocess over
+a fake engine, consumed by a real `earshot` guest, asserting the same
+byte-identical property `room_e2e` asserts, plus forged/expired/lifted signatures,
+token minting, range pass-through, and engine-answer validation.
 
 M1 standing alone is a real property, not a story — but note that M1 as specified
 is close to `ffmpeg -ss N -i URI -c copy -f ogg -`. What actually differentiates
@@ -398,14 +458,52 @@ partner, so the splice only steps back when the page alone does not reach
 **Unknown CLI flags are errors.** A silently ignored `--strat-ms` produces a
 stream that starts in the wrong place and looks like a bug in the splice.
 
+### Settled during M2/M3
+
+- **Whether the room protocol is built at all** (was #3). Built, as the guest
+  half in M2. The deciding argument was that the protocol is *pure HTTP plus a
+  documented cipher* — no librespot, no session — so the guest carries none of
+  the Part 7 exposure. What made it a decision rather than a task was never the
+  code; it was who holds the account, and the answer is "not earshot".
+- **Whether `host` ships at all** (was #1). Shipped in M3, but only in the shape
+  that keeps the previous answer true: earshot serves the room and delegates the
+  session to an external engine. A host that logged in itself would have put the
+  credential, the ToS exposure and a token store back inside earshot — so the
+  question was really "does `host` ship *with* a Spotify login", and that part
+  did not.
+
+- **The room control channel gets TLS, in-process.** `/join` and `/resolve`
+  carry the shared token and the audio key, so in the clear they hand decryption
+  to anyone on the path. (The Spotify *session* never crosses that wire, so the
+  headline property held either way — this is about the room, not the account.)
+  Behind the `tls` feature because it is not free, but cheap: rustls is already
+  in the tree via ureq, leaving `rustls-pemfile` and `zeroize`.
+
+  In the host rather than behind a reverse proxy because a room's whole appeal
+  is that the maintenance surface is one box, and "also run and renew nginx" is
+  a second one. A room has no publicly-signed name, so the guest is pointed at
+  the certificate to trust (`room_ca_cert`) — deliberately **not** a switch that
+  disables verification, which would leave the channel safe from someone
+  listening and open to someone interposing, while reading as though it were
+  secure. Half a TLS identity is a startup error, never a quiet downgrade.
+- **The host caches the engine's answer per track**, so a room costs the engine
+  one resolve rather than one per listener — which is the difference between a
+  room and a hundred simultaneous clients of the one component holding an
+  account. What makes it safe is that staleness is *detected*, not merely
+  bounded: an engine may state `expires_in` (honoured with a margin and a cap),
+  and when the proxy sees the engine refuse a URL the entry is dropped so the
+  next listener re-resolves. A TTL alone would have been a guess about someone
+  else's expiry policy.
+
 ### Still open
 
-1. **Whether `host` ships at all**, given Part 7.
-2. **Whether to close the final-page gap.** A14 means Vorbis prediction is up to
+1. **Whether to close the final-page gap.** A14 means Vorbis prediction is up to
    one block off at the tail. Closing it needs per-packet block sizes, i.e.
    partial decoding — which would cost earshot its "never decodes" property. The
    current answer is to state the bound; revisit only if a consumer needs
    sample-exact tails.
-3. **Whether the room protocol is built at all** — see Part 7. This is now the only
-   thing standing between M1 and a working "one account, many listeners" system,
-   which is precisely why it is a decision and not a task.
+2. **Whether the host↔engine hop deserves the same treatment.** It is plain HTTP
+   unless the engine speaks https, which ureq already handles. Left alone because
+   the two are deployed together by one operator — an engine holds a Spotify
+   session, so it lives beside the host — and a hop that does not cross a network
+   is not the one to spend a certificate on. Revisit if anyone runs them apart.

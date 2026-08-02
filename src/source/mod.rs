@@ -110,10 +110,71 @@ impl From<io::Error> for OpenError {
 /// source and the room client so both talk the same retry language.
 #[cfg(feature = "http")]
 pub(crate) fn http_agent(settings: &crate::config::Settings) -> ureq::Agent {
+    let mut builder = ureq::Agent::config_builder()
+        .timeout_global(Some(settings.timeout_global))
+        .timeout_connect(Some(settings.timeout_connect))
+        .http_status_as_error(false);
+    if let Some(tls) = room_tls_config(settings) {
+        builder = builder.tls_config(tls);
+    }
+    builder.build().into()
+}
+
+/// Trust a specific certificate for the room, when one is configured.
+///
+/// A room on a LAN has no publicly-signed name, and the usual shortcut for that
+/// is a switch that turns verification off — which leaves the channel encrypted
+/// against someone merely listening and completely open to someone in the
+/// middle, while reading as though it were secure. Naming the certificate to
+/// trust costs the operator one file and keeps the guarantee intact, so there
+/// is deliberately no insecure mode.
+///
+/// An unreadable or unparseable `room_ca_cert` falls back to the public roots
+/// rather than failing the process: the setting only ever *narrows* trust, so
+/// the safe direction on a broken value is the stricter one.
+#[cfg(feature = "http")]
+fn room_tls_config(settings: &crate::config::Settings) -> Option<ureq::tls::TlsConfig> {
+    let path = settings
+        .room_ca_cert
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())?;
+    let pem = std::fs::read(path)
+        .map_err(|e| eprintln!("earshot: room_ca_cert {path}: {e}; using the public roots"))
+        .ok()?;
+    let cert = ureq::tls::Certificate::from_pem(&pem)
+        .map_err(|e| eprintln!("earshot: room_ca_cert {path}: {e}; using the public roots"))
+        .ok()?;
+    Some(
+        ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]))
+            .build(),
+    )
+}
+
+/// Like [`http_agent`], but with the idle-connection pool switched off.
+///
+/// For the host talking to an engine it does not control. An engine that
+/// answers HTTP/1.0, closes per response, restarts, or sits behind a proxy with
+/// a request ceiling leaves the pool holding sockets that are already dead —
+/// and the close is only discovered when the *next* request goes out on one.
+/// Retrying does not converge, because when every pooled connection is stale
+/// each attempt just draws another corpse: measured at one failure per 80
+/// concurrent plays even with four attempts.
+///
+/// What the guest loses by pooling is real (a CDN is far away and keep-alive
+/// pays for itself), but the host loses almost nothing: an engine holds a
+/// Spotify session, so it is deployed beside the host, where a fresh loopback
+/// connection costs microseconds against the megabyte it is about to carry.
+/// Intermittent, and surfacing at the guest as "not a Spotify Ogg file", is a
+/// far worse trade than one TCP handshake per window.
+#[cfg(feature = "host")]
+pub(crate) fn http_agent_unpooled(settings: &crate::config::Settings) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(settings.timeout_global))
         .timeout_connect(Some(settings.timeout_connect))
         .http_status_as_error(false)
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
         .build();
     config.into()
 }

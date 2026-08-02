@@ -67,15 +67,30 @@ pub struct RoomClient {
     /// Networks permitted on top of the public internet — empty by default.
     /// See `Settings::room_allow_networks`.
     allow: Vec<Cidr>,
+    /// `"http"` or `"https"`, from `Settings::room_tls`. The control channel
+    /// carries the token and the audio key, so this is the one that matters;
+    /// CDN URLs arrive with their own scheme already on them.
+    scheme: &'static str,
 }
 
 impl RoomClient {
     pub fn new(agent: ureq::Agent, host: String, token: String, allow: Vec<Cidr>) -> Self {
+        RoomClient::with_scheme(agent, host, token, allow, false)
+    }
+
+    pub fn with_scheme(
+        agent: ureq::Agent,
+        host: String,
+        token: String,
+        allow: Vec<Cidr>,
+        tls: bool,
+    ) -> Self {
         RoomClient {
             agent,
             host,
             token,
             allow,
+            scheme: if tls { "https" } else { "http" },
         }
     }
 
@@ -90,7 +105,7 @@ impl RoomClient {
         let body = serde_json::json!({ "token": self.token, "uri": uri }).to_string();
         let mut response = self
             .agent
-            .post(&format!("http://{}/resolve", self.host))
+            .post(&format!("{}://{}/resolve", self.scheme, self.host))
             .header("content-type", "application/json")
             .send(body)
             .map_err(transport_error)?;
