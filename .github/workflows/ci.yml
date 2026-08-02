@@ -84,19 +84,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Assert an empty dependency tree
+      # `--no-default-features` is the claim being guarded: the byte core builds
+      # and tests with nothing at all, which is what keeps it testable over bytes
+      # with no network. The `http` feature legitimately pulls a client.
+      - name: Assert an empty dependency tree for the byte core
         run: |
-          deps=$(cargo tree --edges normal --prefix none --no-dedupe \
+          deps=$(cargo tree --edges normal --prefix none --no-dedupe --no-default-features \
                  | sed '1d' | sed '/^$/d' | sort -u)
           if [ -n "$deps" ]; then
-            echo "::error::earshot gained dependencies:"
+            echo "::error::the byte core gained dependencies:"
             echo "$deps"
             exit 1
           fi
           echo "dependency tree is empty, as intended"
 
-      - name: Unit tests build and run with no network
-        run: cargo test --lib --offline
+      - name: Byte core builds and tests with no dependencies at all
+        run: cargo test --lib --no-default-features --offline
 
   # The installer is the first thing a user runs, it is shell, and it is the one
   # component no Rust test covers. So CI packages a release exactly as

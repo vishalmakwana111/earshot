@@ -24,8 +24,20 @@ categories = ["command-line-utilities", "multimedia::audio"]
 # `vergen = "=9.0.6"` build-dependency pin to have any effect — Cargo silently
 # ignores [build-dependencies] when there is no build script. Add both together.
 [dependencies]
+# Only the `http` feature pulls this. `ureq` rather than `reqwest` because
+# earshot is entirely synchronous — the whole design is "block on a full pipe" —
+# and reqwest's blocking API carries a tokio runtime purely to offer blocking
+# calls. The requests here are ranged GETs with two headers.
+ureq = { version = "3.3.0", optional = true }
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[features]
+default = ["http"]
+# The byte core stays dependency-free: `--no-default-features` builds and tests
+# `ogg`, `codec` and `splice` with an empty dependency tree, which is what keeps
+# them testable over bytes with no network. CI asserts exactly that.
+http = ["dep:ureq"]

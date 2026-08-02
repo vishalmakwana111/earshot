@@ -51,8 +51,13 @@ earshot probe <uri> [--start-ms N]  # metadata JSON on stdout, no audio
 earshot pages <file>                # page structure + checksum validation
 ```
 
-`<uri>` is `file://path` or a bare path. `http(s)://` and `room://` are recognised
-and rejected with a clear message rather than mistaken for filenames.
+`<uri>` is `file://path`, a bare path, or `http(s)://…`. `room://` is recognised and
+rejected with a clear message rather than mistaken for a filename.
+
+Remote reads are ranged, so a late `--start-ms` costs a handful of small requests
+rather than downloading and discarding everything before it. `EARSHOT_HTTP_WINDOW`
+tunes the read-ahead window (default 1 MiB, floor 64 KiB): smaller reaches first
+audio sooner, larger costs fewer round trips.
 
 Unknown flags are **errors**, not ignored — a silently dropped `--strat-ms` would
 stream from the wrong place and look like a splice bug.
@@ -105,12 +110,13 @@ the compressed data. A splicer that deliberately never decodes cannot recover th
 
 ## Architecture
 
-Five layers, each testable over bytes — no audio device, network, or Spotify session
-anywhere in the test suite.
+Five layers, each testable over bytes — no audio device and no Spotify session
+anywhere in the test suite. The only network is loopback, against a fake upstream the
+tests start themselves.
 
 | Layer | Job |
 |---|---|
-| `source` | `trait Source { size, read_at }` — `file://` ✅, `http(s)://` and `room://` planned |
+| `source` | `trait Source { size, read_at }` — `file://` ✅, `http(s)://` ✅, `room://` planned |
 | `ogg` | page parse · serialise · packet walk · CRC · resync · granule bisection |
 | `codec` | granule semantics: Vorbis vs Opus. **The seam that cannot live in `ogg`** |
 | `splice` | pick the start page, renumber, re-checksum, report `actual_start_ms` |
@@ -134,16 +140,18 @@ sources:
 | Milestone | State |
 |---|---|
 | **M0** byte core — page framing, checksums | ✅ |
-| **M1** the tool — `Source`, codec, splice, sink | 🟡 `file://` working; `http://` next |
+| **M1** the tool — `Source`, codec, splice, sink | 🟡 `file://` and `http(s)://` working; config + `--max-idle` next |
 | **M2** `room://` — ranged HTTP + AES-CTR decrypt | ⬜ |
 | **M3** `host` — server side, PKCE login | ⬜ |
 
-Working today: `file://` or a bare path, Ogg Vorbis and Ogg Opus, `--start-ms`
-seeking by granule bisection, metadata, and the full exit-code contract.
+Working today: `file://`, a bare path, or `http(s)://`; Ogg Vorbis and Ogg Opus;
+`--start-ms` seeking by granule bisection; metadata; and the full exit-code contract.
+Remote reads handle the CDN quirks in `DESIGN.md` A9 — a range larger than the file
+answering `200`, resources rotating mid-stream, and `416` carrying the length.
 
 ## Testing
 
-59 tests. The ones that can actually falsify something:
+76 tests. The ones that can actually falsify something:
 
 - **`--start-ms 0` reproduces its input byte for byte** — exercises the whole emit
   path: parse every page, renumber, recompute checksums, write back.
@@ -153,13 +161,16 @@ seeking by granule bisection, metadata, and the full exit-code contract.
 - **Decoded tails match the original's, sample for sample** — the splice corrupts
   nothing downstream.
 - **Bisection agrees with a linear scan at every target**, not a sampled few.
+- **HTTP and `file://` splice to byte-identical output** at every offset, against a
+  fake upstream that answers `200` to ranged requests, rotates its `ETag`, truncates
+  bodies and fails over — an off-by-one in a `Range` header shows up as a diff.
 - **`table[0x80] != 0xEDB88320`** — proves we did not build the reflected CRC-32.
   Ogg's is non-reflected, init 0, no final XOR; an off-the-shelf `crc32` is silently
   wrong.
 
 ```bash
 cargo test                           # everything
-cargo test --lib                     # byte core only: no fixtures, no ffmpeg
+cargo test --lib --no-default-features   # byte core: zero dependencies
 cargo +nightly fuzz run page_scan    # local; asserts roundtrip identity too
 ```
 

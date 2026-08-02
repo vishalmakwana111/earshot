@@ -497,9 +497,13 @@ fn exit_codes_follow_the_contract() {
     assert_eq!(earshot(&["pages"]).code, 1);
     assert_eq!(earshot(&["probe"]).code, 1);
     assert_eq!(earshot(&[good, good]).code, 1);
-    // Unimplemented schemes are usage errors, not mysterious file failures.
-    assert_eq!(earshot(&["http://example.com/a.ogg"]).code, 1);
+    // room:// is still unimplemented, so it is a usage error.
     assert_eq!(earshot(&["room://token@host/track"]).code, 1);
+    // http:// is implemented now, so an unreachable host is a *transport*
+    // failure worth retrying — not a usage error. Port 1 fails immediately;
+    // pointing this at a real hostname would make the suite depend on the
+    // network and take 30s to time out.
+    assert_eq!(earshot(&["http://127.0.0.1:1/a.ogg"]).code, 2);
 
     // 3 — permanently unavailable.
     assert_eq!(earshot(&["/definitely/not/here.ogg"]).code, 3);

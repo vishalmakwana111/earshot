@@ -94,15 +94,31 @@ impl From<ParseError> for SpliceError {
 }
 
 impl SpliceError {
+    /// The underlying I/O failure, wherever in the stack it surfaced.
+    ///
+    /// A transport failure reaching us through the scanner is still a transport
+    /// failure. Matching only on [`SpliceError::Io`] classified a refused
+    /// connection as a malformed stream, which tells a consumer to skip the track
+    /// when it should retry.
+    fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            SpliceError::Io(e) => Some(e.kind()),
+            SpliceError::Scan(ScanError::Io(e)) => Some(e.kind()),
+            _ => None,
+        }
+    }
+
     /// Exit code per the contract in `DESIGN.md`.
     pub fn exit_code(&self) -> u8 {
-        match self {
-            // A source that went away mid-stream is worth retrying.
-            SpliceError::Io(e) if e.kind() == io::ErrorKind::NotFound => 3,
-            SpliceError::Io(e) if e.kind() == io::ErrorKind::Unsupported => 1,
-            SpliceError::Io(_) => 2,
-            // Everything else means the bytes are not the stream we were told.
-            _ => 5,
+        match self.io_kind() {
+            Some(io::ErrorKind::NotFound) => 3,
+            Some(io::ErrorKind::Unsupported) => 1,
+            Some(io::ErrorKind::PermissionDenied) => 4,
+            // Any other transport failure: the bytes are not implicated, so this
+            // is worth retrying rather than skipping.
+            Some(_) => 2,
+            // No I/O involved, so the stream itself is not what we were told.
+            None => 5,
         }
     }
 }
