@@ -28,6 +28,27 @@
 //! from verified properties of Ogg, Vorbis, Opus, HTTP and Unix pipes.
 
 pub mod codec;
+pub mod config;
 pub mod ogg;
+pub mod sink;
 pub mod source;
 pub mod splice;
+
+use std::path::PathBuf;
+
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+pub fn config_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(dir));
+    }
+    home_dir().map(|h| h.join(".config"))
+}
+
+/// Cross-platform home directory.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    let var = "HOME";
+    #[cfg(windows)]
+    let var = "USERPROFILE";
+    std::env::var_os(var).map(PathBuf::from)
+}

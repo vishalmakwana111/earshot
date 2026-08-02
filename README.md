@@ -49,15 +49,26 @@ cargo install --git https://github.com/vishalmakwana111/earshot
 earshot <uri> [--start-ms N]        # Ogg on stdout, metadata on stderr
 earshot probe <uri> [--start-ms N]  # metadata JSON on stdout, no audio
 earshot pages <file>                # page structure + checksum validation
+earshot config --init               # write a commented config file
 ```
+
+Settings layer, highest first: **command line > `EARSHOT_*` >
+`~/.config/earshot/earshot.toml` > defaults.** An unknown key or a bad value is an
+error naming the file and line — never a silent skip, for the same reason unknown
+flags are rejected.
 
 `<uri>` is `file://path`, a bare path, or `http(s)://…`. `room://` is recognised and
 rejected with a clear message rather than mistaken for a filename.
 
 Remote reads are ranged, so a late `--start-ms` costs a handful of small requests
-rather than downloading and discarding everything before it. `EARSHOT_HTTP_WINDOW`
-tunes the read-ahead window (default 1 MiB, floor 64 KiB): smaller reaches first
-audio sooner, larger costs fewer round trips.
+rather than downloading and discarding everything before it. `http_window` tunes the
+read-ahead window (default 1 MiB, floor 64 KiB): smaller reaches first audio sooner,
+larger costs fewer round trips.
+
+`--max-idle SECS|off` (default 60) bounds the pause. A full pipe *is* the pause, but
+a producer parked indefinitely holds an open connection to a possibly time-limited
+URL — so past the ceiling earshot disposes of itself with exit 6 and the consumer
+respawns if it still wants audio.
 
 Unknown flags are **errors**, not ignored — a silently dropped `--strat-ms` would
 stream from the wrong place and look like a splice bug.
@@ -74,6 +85,7 @@ The consumer's whole decision surface, so deliberately finer than pass/fail:
 | 3 | Permanently unavailable | skip the track |
 | 4 | Auth rejected | re-authenticate |
 | 5 | Malformed stream | skip and report |
+| 6 | Idle: the consumer stopped reading | respawn if still wanted |
 
 ### Using it from your program
 
@@ -140,18 +152,19 @@ sources:
 | Milestone | State |
 |---|---|
 | **M0** byte core — page framing, checksums | ✅ |
-| **M1** the tool — `Source`, codec, splice, sink | 🟡 `file://` and `http(s)://` working; config + `--max-idle` next |
+| **M1** the tool — `Source`, codec, splice, sink, config | ✅ |
 | **M2** `room://` — ranged HTTP + AES-CTR decrypt | ⬜ |
 | **M3** `host` — server side, PKCE login | ⬜ |
 
 Working today: `file://`, a bare path, or `http(s)://`; Ogg Vorbis and Ogg Opus;
-`--start-ms` seeking by granule bisection; metadata; and the full exit-code contract.
+`--start-ms` seeking by granule bisection; layered config; the bounded idle ceiling;
+metadata; and the full exit-code contract.
 Remote reads handle the CDN quirks in `DESIGN.md` A9 — a range larger than the file
 answering `200`, resources rotating mid-stream, and `416` carrying the length.
 
 ## Testing
 
-76 tests. The ones that can actually falsify something:
+105 tests. The ones that can actually falsify something:
 
 - **`--start-ms 0` reproduces its input byte for byte** — exercises the whole emit
   path: parse every page, renumber, recompute checksums, write back.
@@ -164,6 +177,11 @@ answering `200`, resources rotating mid-stream, and `416` carrying the length.
 - **HTTP and `file://` splice to byte-identical output** at every offset, against a
   fake upstream that answers `200` to ranged requests, rotates its `ETag`, truncates
   bodies and fails over — an off-by-one in a `Range` header shows up as a diff.
+- **A consumer that stops reading is disposed with exit 6, and one that keeps reading
+  never is** — against a fixture larger than a pipe buffer, since with a smaller file
+  earshot finishes before the consumer's silence could matter.
+- **A mistyped config key fails with its line number**, so a setting cannot quietly
+  do nothing.
 - **`table[0x80] != 0xEDB88320`** — proves we did not build the reflected CRC-32.
   Ogg's is non-reflected, init 0, no final XOR; an off-the-shelf `crc32` is silently
   wrong.
