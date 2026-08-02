@@ -429,26 +429,52 @@ fn reported_stream_parameters_match_what_a_decoder_sees() {
 
 /// A closed pipe is disposal, not failure. Rust ignores SIGPIPE, so the write
 /// returns `BrokenPipe` and earshot must treat it as a clean exit 0.
+///
+/// Done in-process rather than through a shell pipeline for two reasons: no
+/// dependency on which shell exists on the runner, and determinism. Closing the
+/// read end *before* earshot writes anything guarantees the very first write hits
+/// EPIPE — whereas `| head -c 200` cannot, since these fixtures are smaller than
+/// a 64 KiB pipe buffer and would fit entirely without ever blocking.
 #[test]
 fn a_closed_pipe_exits_zero() {
+    use std::io::Read;
+
     let path = fixture_path("vorbis_5s.ogg");
-    let shell = format!(
-        // `head -c` closes the pipe long before the stream ends.
-        "'{}' '{}' --start-ms 1000 2>/dev/null | head -c 200 > /dev/null; echo ${{pipestatus[1]:-${{PIPESTATUS[0]}}}}",
-        BIN,
-        path.display(),
-    );
-    let out = Command::new("zsh")
-        .arg("-c")
-        .arg(&shell)
-        .output()
-        .expect("run shell");
-    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let mut child = Command::new(BIN)
+        .args([path.to_str().unwrap(), "--start-ms", "1000"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn earshot");
+
+    // Dropping the handle closes our read end, so every write earshot attempts
+    // fails with EPIPE.
+    drop(child.stdout.take().expect("stdout"));
+
+    let status = child.wait().expect("wait for earshot");
     assert_eq!(
-        code,
-        "0",
-        "closed pipe should exit 0, got {code:?}; stderr {}",
-        String::from_utf8_lossy(&out.stderr),
+        status.code(),
+        Some(0),
+        "a disposed consumer must be a clean exit, not a failure",
+    );
+
+    // And the partial-consumption case: read a little, then close.
+    let mut child = Command::new(BIN)
+        .args([path.to_str().unwrap(), "--start-ms", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn earshot");
+    {
+        let mut out = child.stdout.take().expect("stdout");
+        let mut buf = [0u8; 200];
+        let _ = out.read(&mut buf);
+    }
+    let status = child.wait().expect("wait for earshot");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "partial read then close must exit 0"
     );
 }
 
