@@ -1,6 +1,6 @@
 [package]
 name = "earshot"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "A streaming audio source tool: any URI to an Ogg stream on stdout, with precise --start-ms splicing"
 license = "MIT"

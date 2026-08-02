@@ -303,10 +303,12 @@ fails for no real reason. So, layered:
    which proves the serialiser before it is trusted to rewrite headers.
 3. **Property tests** — lacing sums equal body length; packet spans tile the
    body; continuation flags agree across page boundaries; granule monotonic or −1.
-4. **Fuzz `ogg::scan`** (`cargo-fuzz`). "Never panics on hostile input" is a
-   claim a fuzzer verifies; a hand-written parser over attacker-influenced bytes
-   is where it would otherwise fail. A bounded pseudo-random stand-in runs in CI
-   today.
+4. **Fuzz the page parser.** "Never panics on hostile input" is a claim a fuzzer
+   verifies; a hand-written parser over attacker-influenced bytes is where it
+   would otherwise fail. `fuzz/fuzz_targets/page_scan.rs` exists and also asserts
+   roundtrip identity over arbitrary input. It needs nightly, so it is local-only
+   until someone has run it; CI carries a bounded pseudo-random stand-in instead.
+   Wiring it into CI is deliberately deferred rather than shipped unverified.
 5. **Splice invariants**, not byte goldens: first output audio page has its
    continuation flag clear, granule ≥ target, sequence numbers contiguous per
    serial, every emitted page self-verifies.
