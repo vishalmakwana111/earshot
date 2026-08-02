@@ -26,9 +26,13 @@
 use std::io;
 
 mod file;
+#[cfg(feature = "http")]
+mod http;
 mod mem;
 
 pub use file::FileSource;
+#[cfg(feature = "http")]
+pub use http::HttpSource;
 pub use mem::MemSource;
 
 /// A random-access window of bytes.
@@ -93,13 +97,26 @@ pub fn open(uri: &str) -> io::Result<Box<dyn Source>> {
     if let Some(rest) = uri.strip_prefix("file://") {
         return Ok(Box::new(FileSource::open(rest)?));
     }
-    for scheme in ["http://", "https://", "room://"] {
+
+    #[cfg(feature = "http")]
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return Ok(Box::new(HttpSource::new(uri)?));
+    }
+    #[cfg(not(feature = "http"))]
+    for scheme in ["http://", "https://"] {
         if uri.starts_with(scheme) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!("{scheme} sources are not implemented yet (M2/M3)"),
+                format!("{scheme} needs the `http` feature"),
             ));
         }
+    }
+
+    if uri.starts_with("room://") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "room:// sources are not implemented yet (M2)",
+        ));
     }
     if let Some((scheme, _)) = uri.split_once("://") {
         return Err(io::Error::new(
@@ -186,8 +203,13 @@ mod tests {
             Ok(_) => panic!("{uri} should not have opened"),
             Err(e) => e.kind(),
         };
-        for uri in ["http://x/y", "https://x/y", "room://tok@host/track"] {
-            assert_eq!(kind(uri), io::ErrorKind::Unsupported, "{uri}");
+        assert_eq!(kind("room://tok@host/track"), io::ErrorKind::Unsupported);
+        // http:// now resolves to a source rather than being rejected. It is not
+        // contacted here — construction only validates the URL.
+        #[cfg(feature = "http")]
+        {
+            assert!(open("http://example.invalid/a.ogg").is_ok());
+            assert!(open("https://example.invalid/a.ogg").is_ok());
         }
         assert_eq!(kind("gopher://x"), io::ErrorKind::Unsupported);
     }
