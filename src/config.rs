@@ -15,8 +15,78 @@
 //! If the config ever grows tables or arrays, swap this for `toml`; the
 //! [`Settings`] surface will not have to change.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// An IP network in CIDR form — the unit of [`Settings::room_allow_networks`].
+///
+/// Hand-parsed for the same reason the blocklist in `room::client` is hand-written:
+/// this is a security decision, and it should not change silently underneath the
+/// project with a dependency bump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cidr {
+    base: IpAddr,
+    bits: u8,
+}
+
+impl Cidr {
+    /// Parse `10.0.0.0/8` or `fd00::/8`. The prefix length is required, so a
+    /// bare address cannot be mistaken for a whole network.
+    pub fn parse(text: &str) -> Result<Cidr, String> {
+        let text = text.trim();
+        let (addr, bits) = text
+            .split_once('/')
+            .ok_or_else(|| format!("{text:?} is not a network (expected e.g. 100.64.0.0/10)"))?;
+        let base: IpAddr = addr
+            .trim()
+            .parse()
+            .map_err(|_| format!("{:?} is not an IP address", addr.trim()))?;
+        let bits: u8 = bits
+            .trim()
+            .parse()
+            .map_err(|_| format!("{:?} is not a prefix length", bits.trim()))?;
+        let max = if base.is_ipv4() { 32 } else { 128 };
+        if bits > max {
+            return Err(format!("/{bits} is longer than {base} allows (max /{max})"));
+        }
+        Ok(Cidr { base, bits })
+    }
+
+    /// Whether `ip` falls inside this network.
+    pub fn contains(&self, ip: &IpAddr) -> bool {
+        // `::ffff:1.2.3.4` is judged as the IPv4 it carries, matching `is_public`.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(*ip),
+            other => *other,
+        };
+        match (self.base, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => prefix_eq(&net.octets(), &ip.octets(), self.bits),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => prefix_eq(&net.octets(), &ip.octets(), self.bits),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.base, self.bits)
+    }
+}
+
+/// Whether two addresses agree on their first `bits` bits.
+fn prefix_eq(net: &[u8], ip: &[u8], bits: u8) -> bool {
+    let whole = (bits / 8) as usize;
+    if net[..whole] != ip[..whole] {
+        return false;
+    }
+    let rest = bits % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - rest);
+    (net[whole] & mask) == (ip[whole] & mask)
+}
 
 /// Default read-ahead window for remote reads.
 pub const HTTP_WINDOW_DEFAULT: usize = 1 << 20;
@@ -40,6 +110,22 @@ pub struct Settings {
     pub max_idle: Option<Duration>,
     pub timeout_connect: Duration,
     pub timeout_global: Duration,
+    /// Room backend (M2): the host to resolve tracks against, e.g. `127.0.0.1:8787`.
+    pub room_host: Option<String>,
+    /// The room's shared token. A credential — `EARSHOT_ROOM_TOKEN` is the
+    /// preferred home for it, since env vars do not show up in `ps`.
+    pub room_token: Option<String>,
+    /// Networks whose addresses the room's CDN URLs may use, on top of the
+    /// public internet. Empty by default, because a compromised room host must
+    /// not turn guests into an internal-network prober (DESIGN Part 7).
+    ///
+    /// A list rather than an "allow private" switch because the real cases are
+    /// each one specific range — `100.64.0.0/10` for a Tailscale room,
+    /// `192.168.0.0/16` for a LAN one, `127.0.0.0/8` for a local test server —
+    /// and a blanket permission would additionally unblock link-local, which is
+    /// where cloud metadata services live. Naming the network you mean costs a
+    /// few characters and gives up nothing else.
+    pub room_allow_networks: Vec<Cidr>,
 }
 
 impl Default for Settings {
@@ -49,6 +135,9 @@ impl Default for Settings {
             max_idle: Some(MAX_IDLE_DEFAULT),
             timeout_connect: Duration::from_secs(10),
             timeout_global: Duration::from_secs(60),
+            room_host: None,
+            room_token: None,
+            room_allow_networks: Vec::new(),
         }
     }
 }
@@ -169,6 +258,33 @@ impl Settings {
             "timeout_global" => {
                 self.timeout_global = Duration::from_secs(parse_secs("timeout_global", value)?);
             }
+            "room_host" => {
+                self.room_host = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "room_token" => {
+                self.room_token = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            }
+            "room_allow_networks" => {
+                self.room_allow_networks = if value.is_empty() {
+                    Vec::new()
+                } else {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(Cidr::parse)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| format!("room_allow_networks: {e}"))?
+                };
+            }
             other => {
                 let known: Vec<&str> = KEYS.iter().map(|(k, _)| *k).collect();
                 return Err(format!(
@@ -193,6 +309,9 @@ const KEYS: &[(&str, &str)] = &[
     ("max_idle", "EARSHOT_MAX_IDLE"),
     ("timeout_connect", "EARSHOT_TIMEOUT_CONNECT"),
     ("timeout_global", "EARSHOT_TIMEOUT_GLOBAL"),
+    ("room_host", "EARSHOT_ROOM_HOST"),
+    ("room_token", "EARSHOT_ROOM_TOKEN"),
+    ("room_allow_networks", "EARSHOT_ROOM_ALLOW_NETWORKS"),
 ];
 
 /// The commented template written by `earshot config --init`, so there is a file
@@ -213,6 +332,22 @@ pub const TEMPLATE: &str = "\
 # Per-request network timeouts, in seconds.
 # timeout_connect = 10
 # timeout_global = 60
+
+# A listening room (M2): the host to resolve tracks against, and the room's
+# shared token. A `spotify:track:...` or `room:spotify:track:...` URI only
+# plays when a room is configured. The token is a credential — prefer the
+# `EARSHOT_ROOM_TOKEN` environment variable over committing it to a file.
+# room_host = \"127.0.0.1:8787\"
+# room_token = \"0123456789abcdef0123456789abcdef\"
+
+# Networks the room's download URLs may live on, besides the public internet.
+# Empty by default so a compromised room cannot use guests to probe inside
+# networks (SSRF). Name the one you actually use — a Tailscale room is
+# 100.64.0.0/10, a LAN one 192.168.0.0/16, a local test server 127.0.0.0/8 —
+# rather than opening every private range, which would include the link-local
+# addresses cloud metadata services answer on. Comma-separated.
+# room_allow_networks = \"100.64.0.0/10\"
+
 ";
 
 #[cfg(test)]
@@ -265,6 +400,7 @@ mod tests {
             "http_window = banana",
             "max_idle = soon",
             "timeout_global = -",
+            "room_allow_networks = 100.64.0.0",
         ] {
             let err = s.apply_file(bad, "test").unwrap_err();
             assert_eq!(err.line, Some(1), "{bad}");
@@ -318,10 +454,43 @@ mod tests {
             let mut s = Settings::default();
             let probe = match *key {
                 "max_idle" => "off",
+                "room_host" => "127.0.0.1:8787",
+                "room_token" => "0123456789abcdef0123456789abcdef",
+                "room_allow_networks" => "127.0.0.0/8",
                 _ => "70000",
             };
             s.apply_one(key, probe)
                 .unwrap_or_else(|e| panic!("{key} listed but not applicable: {e}"));
         }
+    }
+
+    /// Room settings round-trip through the same strict subset as the rest.
+    #[test]
+    fn room_settings_parse_and_round_trip() {
+        let mut s = Settings::default();
+        s.apply_file(
+            "room_host = \"127.0.0.1:8787\"\n\
+             room_token = 0123456789abcdef0123456789abcdef\n\
+             room_allow_networks = \"127.0.0.0/8, 100.64.0.0/10\"\n",
+            "test",
+        )
+        .expect("parse");
+        assert_eq!(s.room_host.as_deref(), Some("127.0.0.1:8787"));
+        assert_eq!(
+            s.room_token.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(s.room_allow_networks.len(), 2);
+        assert!(s.room_allow_networks[0].contains(&"127.0.0.1".parse().unwrap()));
+        assert!(s.room_allow_networks[1].contains(&"100.100.1.1".parse().unwrap()));
+        assert!(!s.room_allow_networks[1].contains(&"8.8.8.8".parse().unwrap()));
+
+        let mut s2 = Settings::default();
+        assert!(
+            s2.room_host.is_none() && s2.room_token.is_none() && s2.room_allow_networks.is_empty()
+        );
+        s2.apply_file("room_host = \"\"\n", "test")
+            .expect("empty host clears");
+        assert_eq!(s2.room_host, None);
     }
 }

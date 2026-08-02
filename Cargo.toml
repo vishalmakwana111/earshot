@@ -16,13 +16,14 @@ categories = ["command-line-utilities", "multimedia::audio"]
 # runs in a tight loop. Dependencies arrive with the milestone that needs them,
 # which per DESIGN.md is:
 #
-#   M1 (sources + pipeline) : anyhow, log, reqwest, serde, serde_json, toml
-#   M2 (room:// backend)    : librespot-core, librespot-audio, aes, ctr
-#   M3 (host subcommand)    : tiny_http, open, rand, sha2, base64
+#   M1 (sources + pipeline) : ureq (ranged GETs, no tokio; reqwest/tokio skipped)
+#   M2 (room:// backend)    : aes, ctr, serde, serde_json, url  (+ ureq, via `http`)
 #
-# Note for M2: librespot-core needs a `build.rs` to be present for the
-# `vergen = "=9.0.6"` build-dependency pin to have any effect — Cargo silently
-# ignores [build-dependencies] when there is no build script. Add both together.
+# Note on M2 vs the original plan: `librespot-core`/`librespot-audio` turned out
+# to be unnecessary for the guest. Resolution is pure HTTP against the room
+# host, and the cipher is AES-128-CTR with a fixed IV (DESIGN A8) — the aes+ctr
+# crates reproduce librespot's `AudioDecrypt` in thirty lines, offset-addressed
+# instead of `io::Read`. The host's librespot dependency is an M3 concern.
 [dependencies]
 # Only the `http` feature pulls this. `ureq` rather than `reqwest` because
 # earshot is entirely synchronous — the whole design is "block on a full pipe" —
@@ -30,14 +31,32 @@ categories = ["command-line-utilities", "multimedia::audio"]
 # calls. The requests here are ranged GETs with two headers.
 ureq = { version = "3.3.0", optional = true }
 
+# M2 — the room:// backend. All optional behind the `room` feature (which
+# implies `http`).
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# `url` is already in the tree via ureq; a direct dependency is what lets the
+# room client parse host URLs with a battle-tested parser at the trust boundary.
+url = { version = "2", optional = true }
+
+[dev-dependencies]
+# Only used by tests to *encrypt* fake fixtures the room client then decrypts.
+aes = "0.8"
+ctr = "0.9"
+
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
 
 [features]
-default = ["http"]
+default = ["http", "room"]
 # The byte core stays dependency-free: `--no-default-features` builds and tests
 # `ogg`, `codec` and `splice` with an empty dependency tree, which is what keeps
 # them testable over bytes with no network. CI asserts exactly that.
 http = ["dep:ureq"]
+# The room:// backend — a strict protocol client plus the AES-CTR + window
+# decorators. Implies `http`: the room client talks HTTP.
+room = ["dep:aes", "dep:ctr", "dep:serde", "dep:serde_json", "dep:url", "http"]
