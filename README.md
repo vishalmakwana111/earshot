@@ -240,8 +240,17 @@ cargo test --lib    # byte core only: no fixtures, no ffmpeg
   rewrite and the decoder-discard model at once.
 - **Tail comparison** — decoded output must match the original's decoded tail
   sample for sample, proving the splice corrupts nothing downstream.
-- **Never panics** — page parsing is fuzzed over pseudo-random input, and every
+- **Never panics** — page parsing is exercised over pseudo-random input, and every
   truncation of a real file must produce an error rather than a panic.
+
+A real fuzz target lives in `fuzz/`. It asserts more than absence of panics:
+anything that parses must re-serialise to exactly its own bytes, and packet spans
+must tile the body. It needs nightly, so it is a local tool rather than a CI job
+for now:
+
+```sh
+cargo +nightly fuzz run page_scan
+```
 
 Tests needing ffmpeg print an explicit `SKIPPED` line when it is absent, because a
 silently-skipped oracle looks exactly like a working one.

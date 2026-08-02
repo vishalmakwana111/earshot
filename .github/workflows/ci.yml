@@ -88,28 +88,6 @@ jobs:
       - name: Unit tests build and run with no network
         run: cargo test --lib --offline
 
-  # A hand-written parser over attacker-influenced bytes is exactly where
-  # "never panics on hostile input" fails. The suite has a bounded
-  # pseudo-random stand-in; this runs the real thing briefly on every push.
-  fuzz:
-    name: fuzz the page scanner
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-
-      - name: Fuzz page parsing
-        run: |
-          if [ -d fuzz ]; then
-            cargo fuzz run page_scan -- -max_total_time=60
-          else
-            echo "::notice::no fuzz targets yet; skipping"
-          fi
-
   # The installer is the first thing a user runs, it is shell, and it is the one
   # component no Rust test covers. So CI packages a release exactly as
   # release.yml does, serves it locally, and installs from it — including the

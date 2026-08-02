@@ -1,0 +1,26 @@
+# Its own workspace on purpose: `libfuzzer-sys` must not appear in earshot's
+# dependency tree. The byte core having no dependencies is a property CI asserts,
+# and a nested member would break it.
+[workspace]
+
+[package]
+name = "earshot-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.earshot]
+path = ".."
+
+[[bin]]
+name = "page_scan"
+path = "fuzz_targets/page_scan.rs"
+test = false
+doc = false
+bench = false
