@@ -36,11 +36,20 @@ jobs:
       # rather than trusting our own parser. Without ffmpeg they print SKIPPED
       # and pass, so installing it is what makes this job meaningful — a
       # skipped oracle looks exactly like a working one.
+      # From the distro rather than a third-party action: the action failed with
+      # "TypeError: fetch failed", and apt's ffmpeg already carries the Vorbis
+      # and Opus decoders these tests need.
+      #
+      # Linux only. The oracle verifies format correctness, which does not vary
+      # by host, and `brew install ffmpeg` costs minutes on every push. macOS
+      # still covers what is platform-specific here: process spawning, paths and
+      # the pipe behaviour.
       - name: Install ffmpeg (external decoder oracle)
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        id: ffmpeg
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Confirm the oracle is present
+        if: runner.os == 'Linux'
         run: ffmpeg -version | head -1
 
       - name: Format
@@ -56,6 +65,7 @@ jobs:
       # actually ran. If ffmpeg were silently missing every decode assertion
       # would vanish and the job would still be green.
       - name: Fail if the decoder oracle was skipped
+        if: runner.os == 'Linux'
         run: |
           cargo test --test end_to_end 2>&1 | tee /tmp/e2e.log
           if grep -q "SKIPPED" /tmp/e2e.log; then
@@ -137,14 +147,33 @@ jobs:
           tar -czf "rel/$name.tar.gz" -C rel "$name"
           rm -rf "rel/$name"
           cp install.sh rel/earshot-installer.sh
-          (cd rel && shasum -a 256 -- * > SHA256SUMS)
+          # `sha256sum` on Linux, `shasum` on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd rel && sha256sum -- * > SHA256SUMS)
+          else
+            (cd rel && shasum -a 256 -- * > SHA256SUMS)
+          fi
           ls -l rel
 
       - name: Serve it and install from it
         run: |
-          python3 -m http.server 8731 --directory rel &
+          python3 -m http.server 8731 --directory rel >/tmp/httpd.log 2>&1 &
           echo $! > /tmp/httpd.pid
-          sleep 1
+          # Wait for the port rather than guessing at a sleep: a server that
+          # never came up otherwise shows up as a confusing 75-second curl
+          # timeout inside the installer.
+          up=
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:8731/SHA256SUMS" -o /dev/null 2>/dev/null; then
+              up=yes; break
+            fi
+            sleep 0.5
+          done
+          if [ -z "$up" ]; then
+            echo "::error::test HTTP server never came up"
+            cat /tmp/httpd.log || true
+            exit 1
+          fi
           EARSHOT_BASE_URL=http://127.0.0.1:8731 EARSHOT_BIN_DIR="$PWD/installed" sh install.sh
           "$PWD/installed/earshot" --version
           "$PWD/installed/earshot" pages tests/fixtures/vorbis_5s.ogg | grep "checksum failures: 0"
