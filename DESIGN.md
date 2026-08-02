@@ -238,11 +238,15 @@ stdout with no audio, which is what scripts and tests should use.
 | 3 | Permanently unavailable | skip track |
 | 4 | Auth / token rejected | re-authenticate |
 | 5 | Malformed stream (truncated, bad CRC) | skip and report |
+| 6 | Idle: consumer stopped reading past `--max-idle` | respawn if still wanted |
 
-**Pause** — the mechanism is backpressure; the policy is bounded.
-`--max-idle <dur>` (default 60 s) exists because a parked producer holds a
-time-limited URL open (D6). On expiry, exit distinctly and let the consumer
-respawn at the saved position.
+**Pause** — the mechanism is backpressure; the policy is bounded. `--max-idle`
+(default 60 s, `off` to disable) exists because a parked producer holds a
+time-limited URL open (D6). A blocking write cannot be given a deadline portably, so
+a watchdog thread stamps write progress and ends the process with exit 6 when none
+happens — the writer is inside a `write` syscall and cannot be asked to notice
+anything. Verified both ways: a non-reading consumer is disposed, and a slowly-but-
+continuously reading one never is.
 
 **Also required:** connect/read/total timeouts, `SIGTERM` → clean exit, and a
 truncated stream at EOF exits 5 rather than 0.
@@ -258,14 +262,24 @@ here, which is why it shipped before any source existed.
 The CRC table is cross-checked three independent ways — hand-computed entries, a
 bitwise implementation derived from the definition, and real ffmpeg output.
 
-**M1 — the tool. 🟡 `file://` working.** Delivered: the `Source` trait with
+**M1 — the tool. ✅ done.** Delivered: the `Source` trait with
 `file://` and an in-memory backend, `ogg::scan` (read-at-offset, resync, granule
 bisection), the `codec` seam for Vorbis and Opus, `splice` with plan/emit split,
 the metadata line, and the full exit-code contract. 59 tests, including 13 that
 drive the real binary and check its output with ffmpeg.
 
-Still to do for M1: `http://` (ranged reader with `If-Range`, resume and URL
-fallback), `--max-idle`, and layered config.
+`http(s)://` landed as a ranged reader handling the A9 quirks; `--max-idle` bounds
+the pause per D6; config layers CLI > `EARSHOT_*` > file > defaults with a strict
+hand-written parser (a flat four-key file did not justify ten crates for `toml` +
+`serde`, and it rejects unknown keys rather than skipping them).
+
+**SIGTERM needs no handler, and that is a finding rather than an omission.** earshot
+holds nothing requiring teardown: no child processes, no temp files, no terminal
+state. Measured: SIGTERM exits 143 (the conventional 128+15) with zero orphans and
+zero leftover files, and a truncated final page is exactly what "kill = dispose"
+already means in the contract. A handler would buy exit 0 instead of 143 and
+termination on a page boundary — neither required for correctness, both costing a
+signal dependency. Revisit only if a supervisor needs 0.
 
 Three bugs worth recording, because each was found by a test that a weaker suite
 would not have contained:
@@ -392,6 +406,6 @@ stream that starts in the wrong place and looks like a bug in the splice.
    partial decoding — which would cost earshot its "never decodes" property. The
    current answer is to state the bound; revisit only if a consumer needs
    sample-exact tails.
-3. **`--max-idle` is specified but not implemented.** D6 says pause must be
-   bounded; M1 has no timer. Needs doing before any long-lived source (M2) makes
-   it matter.
+3. **Whether the room protocol is built at all** — see Part 7. This is now the only
+   thing standing between M1 and a working "one account, many listeners" system,
+   which is precisely why it is a decision and not a task.

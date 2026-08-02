@@ -1,10 +1,14 @@
 //! earshot CLI.
 //!
 //! ```text
-//! earshot <uri> [--start-ms N]     Ogg on stdout, metadata line on stderr
+//! earshot <uri> [--start-ms N] [--max-idle SECS|off]
 //! earshot probe <uri> [--start-ms N]   metadata JSON on stdout, no audio
-//! earshot pages <file>             page structure and checksum validation
+//! earshot pages <file>                 page structure and checksum validation
+//! earshot config --init                write a commented config file
 //! ```
+//!
+//! Settings layer as `DESIGN.md` Part 4 specifies: command line > `EARSHOT_*` >
+//! `~/.config/earshot/earshot.toml` > built-in defaults.
 //!
 //! stdout is sacred: on the streaming path it carries Ogg bytes and nothing else.
 //! The metadata line goes to stderr prefixed `earshot-meta:` and is written
@@ -14,9 +18,12 @@
 
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
+use earshot::config::{self, Settings};
 use earshot::ogg::scan::Scanner;
 use earshot::ogg::{page::Pages, GRANULE_NONE};
+use earshot::sink::{self, Progress};
 use earshot::source;
 use earshot::splice;
 
@@ -38,9 +45,14 @@ fn main() -> ExitCode {
             println!("earshot {}", env!("CARGO_PKG_VERSION"));
             ExitCode::from(EXIT_OK)
         }
-        Ok(Command::Stream { uri, start_ms }) => cmd_stream(&uri, start_ms, true),
-        Ok(Command::Probe { uri, start_ms }) => cmd_stream(&uri, start_ms, false),
+        Ok(Command::Stream {
+            uri,
+            start_ms,
+            max_idle,
+        }) => cmd_stream(&uri, start_ms, true, max_idle),
+        Ok(Command::Probe { uri, start_ms }) => cmd_stream(&uri, start_ms, false, None),
         Ok(Command::Pages { path }) => cmd_pages(&path),
+        Ok(Command::ConfigInit) => cmd_config_init(),
         Err(message) => {
             eprintln!("earshot: {message}");
             eprintln!("try `earshot --help`");
@@ -50,9 +62,20 @@ fn main() -> ExitCode {
 }
 
 enum Command {
-    Stream { uri: String, start_ms: u64 },
-    Probe { uri: String, start_ms: u64 },
-    Pages { path: String },
+    Stream {
+        uri: String,
+        start_ms: u64,
+        max_idle: Option<Duration>,
+    },
+    Probe {
+        uri: String,
+        start_ms: u64,
+    },
+    Pages {
+        path: String,
+    },
+    /// Write a commented config template, so there is a file to edit.
+    ConfigInit,
     Help,
     Version,
 }
@@ -65,6 +88,10 @@ impl Command {
     fn parse(args: &[String]) -> Result<Command, String> {
         let mut positional: Vec<&str> = Vec::new();
         let mut start_ms: Option<u64> = None;
+        // Only set when the flag is actually given, so a default does not
+        // outrank an explicit config-file entry.
+        let mut max_idle_flag: Option<Option<Duration>> = None;
+        let mut init = false;
         let mut index = 0;
 
         while index < args.len() {
@@ -82,6 +109,21 @@ impl Command {
                             .map_err(|_| format!("--start-ms: {value:?} is not a whole number"))?,
                     );
                     index += 2;
+                }
+                "--init" => {
+                    init = true;
+                    index += 1;
+                }
+                "--max-idle" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| "--max-idle needs seconds or \"off\"".to_string())?;
+                    max_idle_flag = Some(parse_max_idle(value)?);
+                    index += 2;
+                }
+                _ if arg.starts_with("--max-idle=") => {
+                    max_idle_flag = Some(parse_max_idle(&arg["--max-idle=".len()..])?);
+                    index += 1;
                 }
                 _ if arg.starts_with("--start-ms=") => {
                     let value = &arg["--start-ms=".len()..];
@@ -105,7 +147,15 @@ impl Command {
         }
 
         let start_ms = start_ms.unwrap_or(0);
+        // Layers below the CLI, then the flag if it was given.
+        let settings = Settings::load().map_err(|e| e.to_string())?;
+        let max_idle = max_idle_flag.unwrap_or(settings.max_idle);
+
         match positional.as_slice() {
+            ["config", "init"] => Ok(Command::ConfigInit),
+            ["config"] if init => Ok(Command::ConfigInit),
+            ["config"] => Err("config needs --init".to_string()),
+            _ if init => Err("--init is only valid for `earshot config`".to_string()),
             [] => Ok(Command::Help),
             ["pages", path] => Ok(Command::Pages {
                 path: (*path).to_string(),
@@ -119,6 +169,7 @@ impl Command {
             [uri] => Ok(Command::Stream {
                 uri: (*uri).to_string(),
                 start_ms,
+                max_idle,
             }),
             _ => Err(format!(
                 "expected one URI, got {}: {}",
@@ -138,21 +189,69 @@ USAGE:
     earshot <uri> [--start-ms N]        Ogg on stdout, metadata on stderr
     earshot probe <uri> [--start-ms N]  metadata JSON on stdout, no audio
     earshot pages <file>                page structure and checksum validation
+    earshot config --init               write a commented config file
+
+OPTIONS:
+    --start-ms N                        where to start
+    --max-idle SECS|off                 dispose after the consumer stops reading
 
 URIs:
-    file://path, or a bare path         supported
-    http(s)://, room://                 not implemented yet
+    file://path, a bare path, http(s):// supported
+    room://                              not implemented yet
 
 EXIT CODES:
-    0 clean (including a closed pipe)   3 permanently unavailable
-    1 usage                             4 auth rejected
-    2 transient failure — retry         5 malformed stream",
+    0 clean (including a closed pipe)   4 auth rejected
+    1 usage                             5 malformed stream
+    2 transient failure — retry         6 idle: consumer stopped reading
+    3 permanently unavailable
+
+Settings layer: command line > EARSHOT_* > ~/.config/earshot/earshot.toml",
         env!("CARGO_PKG_VERSION"),
     );
 }
 
 /// The streaming path. `write_audio` false means probe: metadata only.
-fn cmd_stream(uri: &str, start_ms: u64, write_audio: bool) -> ExitCode {
+/// `off`/`0` disables the watchdog; anything else is seconds.
+fn parse_max_idle(value: &str) -> Result<Option<Duration>, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value == "0" {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(|s| Some(Duration::from_secs(s)))
+        .map_err(|_| format!("--max-idle: {value:?} is not seconds or \"off\""))
+}
+
+fn cmd_config_init() -> ExitCode {
+    let Some(path) = config::config_path() else {
+        eprintln!("earshot: no config directory (set HOME or EARSHOT_CONFIG)");
+        return ExitCode::from(EXIT_USAGE);
+    };
+    if path.exists() {
+        // Never clobber an edited config.
+        println!("{} already exists; leaving it alone", path.display());
+        return ExitCode::from(EXIT_OK);
+    }
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("earshot: {}: {e}", dir.display());
+            return ExitCode::from(EXIT_USAGE);
+        }
+    }
+    match std::fs::write(&path, config::TEMPLATE) {
+        Ok(()) => {
+            println!("wrote {}", path.display());
+            ExitCode::from(EXIT_OK)
+        }
+        Err(e) => {
+            eprintln!("earshot: {}: {e}", path.display());
+            ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+fn cmd_stream(uri: &str, start_ms: u64, write_audio: bool, max_idle: Option<Duration>) -> ExitCode {
     let src = match source::open(uri) {
         Ok(s) => s,
         Err(e) => {
@@ -183,9 +282,14 @@ fn cmd_stream(uri: &str, start_ms: u64, write_audio: bool) -> ExitCode {
     // before it starts decoding.
     eprintln!("earshot-meta: {}", plan.info.to_json());
 
+    // Pause is a full pipe, but a producer parked forever holds an open
+    // connection to a possibly time-limited URL. See DESIGN.md D6.
+    let progress = Progress::new();
+    sink::spawn_idle_watchdog(progress.clone(), max_idle);
+
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    match splice::emit(&mut scanner, &plan, &mut out) {
+    match splice::emit_with_progress(&mut scanner, &plan, &mut out, &progress) {
         // A closed pipe is the consumer disposing of us, which is a clean end.
         Ok(_) => ExitCode::from(EXIT_OK),
         Err(e) => {

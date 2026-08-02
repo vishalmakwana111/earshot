@@ -28,6 +28,7 @@ use crate::codec::{Codec, CodecError};
 use crate::ogg::page::{self, PageHeader};
 use crate::ogg::scan::{ScanError, Scanner};
 use crate::ogg::ParseError;
+use crate::sink::{self, Disposition, Progress};
 use crate::source::Source;
 
 /// Bound on page-stepping loops, so a pathological stream cannot spin forever.
@@ -311,12 +312,23 @@ pub fn emit<S: Source, W: Write>(
     plan: &Plan,
     out: &mut W,
 ) -> Result<Emitted, SpliceError> {
+    emit_with_progress(scanner, plan, out, &Progress::new())
+}
+
+/// [`emit`], stamping write progress so an idle watchdog can tell a parked
+/// consumer from a slow one.
+pub fn emit_with_progress<S: Source, W: Write>(
+    scanner: &mut Scanner<S>,
+    plan: &Plan,
+    out: &mut W,
+    progress: &Progress,
+) -> Result<Emitted, SpliceError> {
     let mut sequence = 0u32;
     let mut bytes = 0u64;
     let mut pages = 0usize;
 
     for &offset in &plan.header_offsets {
-        match write_page(scanner, offset, sequence, out)? {
+        match write_page(scanner, offset, sequence, out, progress)? {
             Some(n) => {
                 bytes += n;
                 pages += 1;
@@ -336,7 +348,7 @@ pub fn emit<S: Source, W: Write>(
     while offset < plan.source_len {
         let at = scanner.page_at(offset)?;
         let next = at.next_offset();
-        match write_page(scanner, offset, sequence, out)? {
+        match write_page(scanner, offset, sequence, out, progress)? {
             Some(n) => {
                 bytes += n;
                 pages += 1;
@@ -353,16 +365,12 @@ pub fn emit<S: Source, W: Write>(
         offset = next;
     }
 
-    match out.flush() {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-            return Ok(Emitted {
-                bytes,
-                pages,
-                disposed: true,
-            })
-        }
-        Err(e) => return Err(e.into()),
+    if sink::flush(out)? == Disposition::Disposed {
+        return Ok(Emitted {
+            bytes,
+            pages,
+            disposed: true,
+        });
     }
 
     Ok(Emitted {
@@ -378,16 +386,14 @@ fn write_page<S: Source, W: Write>(
     offset: u64,
     sequence: u32,
     out: &mut W,
+    progress: &Progress,
 ) -> Result<Option<u64>, SpliceError> {
     let mut at = scanner.page_at(offset)?;
     page::set_sequence(&mut at.bytes, sequence)?;
     page::recompute_crc_in_place(&mut at.bytes)?;
-    match out.write_all(&at.bytes) {
-        Ok(()) => Ok(Some(at.bytes.len() as u64)),
-        // Rust ignores SIGPIPE, so a closed consumer surfaces here rather than
-        // killing the process. That is disposal, not failure.
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(None),
-        Err(e) => Err(e.into()),
+    match sink::write_all(out, &at.bytes, progress)? {
+        Disposition::Complete => Ok(Some(at.bytes.len() as u64)),
+        Disposition::Disposed => Ok(None),
     }
 }
 

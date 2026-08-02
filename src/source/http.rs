@@ -31,35 +31,9 @@
 //! bisection still gets its random access.
 
 use std::io::{self, Read};
-use std::time::Duration;
 
 use super::Source;
-
-/// Default read-ahead window. Sequential playback then costs one request per
-/// megabyte, while a bisection probe still only pays for one.
-const CHUNK_DEFAULT: usize = 1 << 20;
-
-/// Smallest window worth requesting: below a maximum Ogg page, a single page read
-/// would need two round trips.
-const CHUNK_MIN: usize = 64 * 1024;
-
-/// Read-ahead window, overridable via `EARSHOT_HTTP_WINDOW` (bytes).
-///
-/// A real tuning knob rather than a test hook: a smaller window reaches first
-/// audio sooner and wastes less on a seek-heavy consumer, a larger one costs fewer
-/// round trips when streaming straight through. Values below [`CHUNK_MIN`] are
-/// raised, since a window smaller than a page defeats the purpose.
-fn chunk_size() -> usize {
-    std::env::var("EARSHOT_HTTP_WINDOW")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.max(CHUNK_MIN))
-        .unwrap_or(CHUNK_DEFAULT)
-}
-
-/// Per-request ceiling. A hung upstream must not hang the consumer forever.
-const TIMEOUT_GLOBAL: Duration = Duration::from_secs(60);
-const TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
+use crate::config::Settings;
 
 /// Classify an HTTP status the contract cares about.
 ///
@@ -95,13 +69,13 @@ pub struct HttpSource {
 }
 
 impl HttpSource {
-    /// A single URL.
+    /// A single URL, with settings from the config layers.
     pub fn new(url: impl Into<String>) -> io::Result<Self> {
-        Self::with_fallbacks(vec![url.into()])
+        Self::with_fallbacks(vec![url.into()], &Settings::load().unwrap_or_default())
     }
 
     /// Several interchangeable URLs, tried in order.
-    pub fn with_fallbacks(urls: Vec<String>) -> io::Result<Self> {
+    pub fn with_fallbacks(urls: Vec<String>, settings: &Settings) -> io::Result<Self> {
         if urls.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -121,8 +95,8 @@ impl HttpSource {
         // something specific, and ureq would otherwise turn 4xx/5xx into an
         // error before it could be inspected.
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT_GLOBAL))
-            .timeout_connect(Some(TIMEOUT_CONNECT))
+            .timeout_global(Some(settings.timeout_global))
+            .timeout_connect(Some(settings.timeout_connect))
             .http_status_as_error(false)
             .build();
 
@@ -134,7 +108,7 @@ impl HttpSource {
             etag: None,
             buf: Vec::new(),
             buf_start: 0,
-            chunk: chunk_size(),
+            chunk: settings.http_window,
         })
     }
 
@@ -391,9 +365,20 @@ mod tests {
 
     #[test]
     fn an_empty_candidate_list_is_rejected() {
-        let err = HttpSource::with_fallbacks(Vec::new())
+        let err = HttpSource::with_fallbacks(Vec::new(), &Settings::default())
             .map(|_| ())
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn the_window_comes_from_settings() {
+        let settings = Settings {
+            http_window: 128 * 1024,
+            ..Settings::default()
+        };
+        let src =
+            HttpSource::with_fallbacks(vec!["http://x/y".into()], &settings).expect("construct");
+        assert_eq!(src.chunk, 128 * 1024);
     }
 }
