@@ -1,0 +1,31 @@
+[package]
+name = "earshot"
+version = "0.0.1"
+edition = "2021"
+description = "A streaming audio source tool: any URI to an Ogg stream on stdout, with precise --start-ms splicing"
+license = "MIT"
+repository = "https://github.com/vishalmakwana111/earshot"
+readme = "README.md"
+keywords = ["ogg", "audio", "streaming", "splice", "cli"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+# M0 — the byte core — has no dependencies, on purpose.
+#
+# "Every layer is testable over bytes" has to be true of the build too: a CRC
+# test that first compiles librespot, tokio and a TLS stack is a test nobody
+# runs in a tight loop. Dependencies arrive with the milestone that needs them,
+# which per DESIGN.md is:
+#
+#   M1 (sources + pipeline) : anyhow, log, reqwest, serde, serde_json, toml
+#   M2 (room:// backend)    : librespot-core, librespot-audio, aes, ctr
+#   M3 (host subcommand)    : tiny_http, open, rand, sha2, base64
+#
+# Note for M2: librespot-core needs a `build.rs` to be present for the
+# `vergen = "=9.0.6"` build-dependency pin to have any effect — Cargo silently
+# ignores [build-dependencies] when there is no build script. Add both together.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
