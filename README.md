@@ -37,14 +37,21 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/vishalmakwana111/earshot/releases/latest/download/earshot-installer.sh | sh
 ```
 
+Or from source, on any platform with Rust:
+
 ```bash
-cargo install earshot        # any platform with Rust
+cargo install --git https://github.com/vishalmakwana111/earshot
 ```
 
 Prebuilt for `x86_64`/`aarch64` Linux, Intel and Apple-Silicon macOS, and
 `x86_64` Windows. Windows users: grab the `.zip` from
-[Releases](https://github.com/vishalmakwana111/earshot/releases) or use
-`cargo install`.
+[Releases](https://github.com/vishalmakwana111/earshot/releases).
+
+> **Not yet on crates.io.** The name `earshot` there belongs to an unrelated
+> voice-activity-detection crate, so `cargo install earshot` would fetch someone
+> else's software — don't use it. Publishing needs a distinct crate name (the
+> *binary* can still be `earshot`, the way the `ripgrep` crate ships `rg`).
+> Until then, install with the script above or `--git`.
 
 The installer refuses to install on a checksum mismatch, and `EARSHOT_BIN_DIR`
 overrides where it lands. CI packages a release, serves it, and installs from it
