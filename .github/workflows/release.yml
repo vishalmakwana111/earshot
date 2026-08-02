@@ -70,8 +70,25 @@ jobs:
           fi
           echo "tag and crate agree on $crate"
 
+      # `--features tls` rather than the defaults, which are only `http` +
+      # `room`. Someone installing a prebuilt binary cannot turn a feature on
+      # afterwards, so the published artifact has to carry everything the
+      # release claims — 0.2.0 shipped once without this and advertised
+      # `earshot host` in its own --help while lacking the subcommand.
+      # `tls` implies `host`, which implies `room`, which implies `http`.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --features tls --target ${{ matrix.target }}
+
+      # The release names its features; prove the binary has them rather than
+      # trusting the flag above stayed correct.
+      - name: The artifact carries the features the release claims
+        if: runner.os != 'Windows' && !matrix.cross
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/earshot
+          "$bin" --help | grep -q "earshot host" \
+            || { echo "::error::built binary has no host subcommand"; exit 1; }
+          echo "host subcommand present"
 
       # Smoke-test the artifact we are about to publish. A binary that cannot
       # answer --version is not worth shipping, and this catches a broken
