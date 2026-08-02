@@ -104,6 +104,32 @@ Transport maps onto the process: pause by **stopping reading** (the pipe fills a
 earshot blocks in `write`), seek by **respawning** with a new `--start-ms`, stop by
 **killing**. [myx](https://github.com/HaseebKhalid1507/Myx) does exactly this.
 
+#### With myx
+
+myx is a Spotify TUI that streams through librespot, which needs a Premium
+session. Its `--guest` mode starts without one so a free account can browse — and
+uses earshot as the thing that actually makes sound.
+
+Install earshot anywhere on `PATH` and myx finds it by name; there is nothing to
+configure:
+
+```bash
+myx --guest --play ~/music/track.ogg
+myx --guest --play https://example.com/track.ogg
+```
+
+Point it somewhere else with `--source /path/to/earshot`, or `MYX_SOURCE`. If the
+helper is missing, myx says so and how to install it rather than failing silently.
+
+myx spawns `earshot <uri> --start-ms N`, drains stderr on its own thread, and
+counts position from `actual_start_ms` — the two obligations above. Pause stops
+its read loop, seek kills and respawns, stop kills. Audio lands in myx's normal
+output stack, so the FFT visualiser works on this path too.
+
+One asymmetry worth knowing: myx decodes with symphonia, which ships no Opus
+decoder, so **Ogg Vorbis only** on that side. earshot serves Opus perfectly well
+to anything that can decode it.
+
 #### Accuracy of `actual_start_ms`
 
 Measured against ffmpeg, not asserted. Never *later* than requested — overshooting
