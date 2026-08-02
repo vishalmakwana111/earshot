@@ -184,6 +184,13 @@ impl Command {
             ["host"] => Ok((Command::Host, settings)),
             #[cfg(feature = "host")]
             ["host", ..] => Err("host takes no arguments (see settings)".to_string()),
+            // Without the feature, `host` would otherwise fall through to the
+            // URI branch and be reported as a missing *file*, which reads as a
+            // broken install rather than a build that simply omits it.
+            #[cfg(not(feature = "host"))]
+            ["host", ..] => {
+                Err("this build has no `host` subcommand — rebuild with `--features host`".into())
+            }
             [uri] => Ok((
                 Command::Stream {
                     uri: (*uri).to_string(),
@@ -201,6 +208,18 @@ impl Command {
     }
 }
 
+/// The `host` line, only when this build actually has the subcommand.
+///
+/// Help that advertises a command the binary does not carry is worse than no
+/// help: `earshot host` then falls through to the URI branch and reports
+/// `host: No such file or directory`, which reads as a broken install rather
+/// than a build without the feature.
+#[cfg(feature = "host")]
+const HOST_USAGE: &str =
+    "\n    earshot host                        serve a listening room (host_bind/host_engine)";
+#[cfg(not(feature = "host"))]
+const HOST_USAGE: &str = "";
+
 fn print_help(out: &mut impl Write) {
     let _ = writeln!(
         out,
@@ -210,8 +229,7 @@ USAGE:
     earshot <uri> [--start-ms N]        Ogg on stdout, metadata on stderr
     earshot probe <uri> [--start-ms N]  metadata JSON on stdout, no audio
     earshot pages <file>                page structure and checksum validation
-    earshot config --init               write a commented config file
-    earshot host                        serve a listening room (host_bind/host_engine)
+    earshot config --init               write a commented config file{}
 
 OPTIONS:
     --start-ms N                        where to start
@@ -230,6 +248,7 @@ EXIT CODES:
 
 Settings layer: command line > EARSHOT_* > ~/.config/earshot/earshot.toml",
         env!("CARGO_PKG_VERSION"),
+        HOST_USAGE,
     );
 }
 
