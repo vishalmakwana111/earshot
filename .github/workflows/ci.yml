@@ -1,0 +1,192 @@
+name: CI
+
+# Branch pushes are covered by `pull_request`; limiting `push` to main keeps a
+# commit on a PR branch from running the whole matrix twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes whatever was still running for the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The end-to-end tests decode earshot's output with an independent decoder
+      # rather than trusting our own parser. Without ffmpeg they print SKIPPED
+      # and pass, so installing it is what makes this job meaningful — a
+      # skipped oracle looks exactly like a working one.
+      - name: Install ffmpeg (external decoder oracle)
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        id: ffmpeg
+
+      - name: Confirm the oracle is present
+        run: ffmpeg -version | head -1
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # The suite is designed to run without an oracle, so prove the oracle
+      # actually ran. If ffmpeg were silently missing every decode assertion
+      # would vanish and the job would still be green.
+      - name: Fail if the decoder oracle was skipped
+        run: |
+          cargo test --test end_to_end 2>&1 | tee /tmp/e2e.log
+          if grep -q "SKIPPED" /tmp/e2e.log; then
+            echo "::error::ffmpeg-backed tests were skipped; the oracle did not run"
+            exit 1
+          fi
+
+  # The byte core is dependency-free on purpose. This guards that claim: a stray
+  # dependency would make `cargo test --lib` need a network and a lockfile
+  # resolution, and the "testable over bytes" property would quietly die.
+  no-dependencies:
+    name: byte core has no dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Assert an empty dependency tree
+        run: |
+          deps=$(cargo tree --edges normal --prefix none --no-dedupe \
+                 | sed '1d' | sed '/^$/d' | sort -u)
+          if [ -n "$deps" ]; then
+            echo "::error::earshot gained dependencies:"
+            echo "$deps"
+            exit 1
+          fi
+          echo "dependency tree is empty, as intended"
+
+      - name: Unit tests build and run with no network
+        run: cargo test --lib --offline
+
+  # A hand-written parser over attacker-influenced bytes is exactly where
+  # "never panics on hostile input" fails. The suite has a bounded
+  # pseudo-random stand-in; this runs the real thing briefly on every push.
+  fuzz:
+    name: fuzz the page scanner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz page parsing
+        run: |
+          if [ -d fuzz ]; then
+            cargo fuzz run page_scan -- -max_total_time=60
+          else
+            echo "::notice::no fuzz targets yet; skipping"
+          fi
+
+  # The installer is the first thing a user runs, it is shell, and it is the one
+  # component no Rust test covers. So CI packages a release exactly as
+  # release.yml does, serves it locally, and installs from it — including the
+  # paths that must *refuse*.
+  installer:
+    name: installer round-trip
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint the installer
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck install.sh
+          else
+            sudo apt-get update && sudo apt-get install -y shellcheck && shellcheck install.sh
+          fi
+
+      # It has to run under more than bash: the curl|sh idiom hands it to
+      # whatever /bin/sh is, which on Debian is dash.
+      - name: Check it parses under dash
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y dash && dash -n install.sh
+
+      - name: Package a release the way release.yml does
+        run: |
+          case "${{ runner.os }}" in
+            Linux) target=$(uname -m)-unknown-linux-gnu ;;
+            macOS) target=$(uname -m | sed 's/arm64/aarch64/')-apple-darwin ;;
+          esac
+          echo "TARGET=$target" >> "$GITHUB_ENV"
+          cargo build --release --locked
+          name="earshot-$target"
+          mkdir -p "rel/$name"
+          cp target/release/earshot README.md DESIGN.md LICENSE "rel/$name/"
+          tar -czf "rel/$name.tar.gz" -C rel "$name"
+          rm -rf "rel/$name"
+          cp install.sh rel/earshot-installer.sh
+          (cd rel && shasum -a 256 -- * > SHA256SUMS)
+          ls -l rel
+
+      - name: Serve it and install from it
+        run: |
+          python3 -m http.server 8731 --directory rel &
+          echo $! > /tmp/httpd.pid
+          sleep 1
+          EARSHOT_BASE_URL=http://127.0.0.1:8731 EARSHOT_BIN_DIR="$PWD/installed" sh install.sh
+          "$PWD/installed/earshot" --version
+          "$PWD/installed/earshot" pages tests/fixtures/vorbis_5s.ogg | grep "checksum failures: 0"
+
+      - name: A tampered archive must be refused
+        run: |
+          printf 'tampered' >> "rel/earshot-$TARGET.tar.gz"
+          if EARSHOT_BASE_URL=http://127.0.0.1:8731 EARSHOT_BIN_DIR="$PWD/tampered" sh install.sh; then
+            echo "::error::installer accepted a tampered archive"
+            exit 1
+          fi
+          if [ -e "$PWD/tampered/earshot" ]; then
+            echo "::error::installer left a binary behind after refusing"
+            exit 1
+          fi
+          echo "tampered archive correctly refused"
+
+      - name: A missing artifact must fail, not half-install
+        run: |
+          if EARSHOT_BASE_URL=http://127.0.0.1:8731/nope EARSHOT_BIN_DIR="$PWD/missing" sh install.sh; then
+            echo "::error::installer succeeded against a 404"
+            exit 1
+          fi
+          echo "missing artifact correctly reported"
+
+      - name: Stop the test server
+        if: always()
+        run: kill "$(cat /tmp/httpd.pid)" 2>/dev/null || true

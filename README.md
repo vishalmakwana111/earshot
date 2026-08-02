@@ -27,6 +27,46 @@ Two things it gives you that `ffmpeg -ss N -c copy -f ogg -` does not:
   closed pipe is disposal and exits 0. Backpressure is the interface, not an
   accident.
 
+## Install
+
+No toolchain, no clone. The installer picks the right prebuilt binary for your
+machine, verifies its checksum, and puts it on your PATH:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/vishalmakwana111/earshot/releases/latest/download/earshot-installer.sh | sh
+```
+
+```bash
+cargo install earshot        # any platform with Rust
+```
+
+Prebuilt for `x86_64`/`aarch64` Linux, Intel and Apple-Silicon macOS, and
+`x86_64` Windows. Windows users: grab the `.zip` from
+[Releases](https://github.com/vishalmakwana111/earshot/releases) or use
+`cargo install`.
+
+The installer refuses to install on a checksum mismatch, and `EARSHOT_BIN_DIR`
+overrides where it lands. CI packages a release, serves it, and installs from it
+on every push — including the paths that must refuse — because the installer is
+the first thing a user runs and no Rust test covers it.
+
+### Using it from another program
+
+earshot is a byte pipe, so consuming it needs no library dependency:
+
+```bash
+earshot track.ogg --start-ms 90000 | mpv -
+```
+
+[myx](https://github.com/HaseebKhalid1507/Myx) does exactly this — spawn it,
+read the metadata line from stderr, decode stdout. Two obligations on the
+consumer:
+
+- **Drain stderr.** A full stderr pipe blocks earshot's writer, which surfaces as
+  audio stalling and looks exactly like a decode bug.
+- **Trust `actual_start_ms`, not your request.** Splices land on page boundaries.
+
 ---
 
 ## Status
