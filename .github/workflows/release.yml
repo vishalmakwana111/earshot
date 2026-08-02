@@ -74,7 +74,7 @@ jobs:
           cp target/${{ matrix.target }}/release/earshot "dist/$name/"
           cp README.md DESIGN.md LICENSE "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
-          shasum -a 256 "dist/$name.tar.gz" | awk '{print $1"  "'"'"$name.tar.gz"'"'"}' > "dist/$name.tar.gz.sha256"
+          rm -rf "dist/$name"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -85,7 +85,7 @@ jobs:
           cp target/${{ matrix.target }}/release/earshot.exe "dist/$name/"
           cp README.md DESIGN.md LICENSE "dist/$name/"
           (cd dist && 7z a "$name.zip" "$name" >/dev/null)
-          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          rm -rf "dist/$name"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,7 +93,6 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.zip
-            dist/*.sha256
           if-no-files-found: error
 
   release:
