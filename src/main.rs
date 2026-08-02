@@ -36,28 +36,31 @@ const EXIT_MALFORMED: u8 = 5;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match Command::parse(&args) {
-        Ok(Command::Help) => {
-            print_help(&mut io::stdout());
-            ExitCode::from(EXIT_OK)
-        }
-        Ok(Command::Version) => {
-            println!("earshot {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::from(EXIT_OK)
-        }
-        Ok(Command::Stream {
-            uri,
-            start_ms,
-            max_idle,
-        }) => cmd_stream(&uri, start_ms, true, max_idle),
-        Ok(Command::Probe { uri, start_ms }) => cmd_stream(&uri, start_ms, false, None),
-        Ok(Command::Pages { path }) => cmd_pages(&path),
-        Ok(Command::ConfigInit) => cmd_config_init(),
+    let (command, settings) = match Command::parse(&args) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("earshot: {message}");
             eprintln!("try `earshot --help`");
-            ExitCode::from(EXIT_USAGE)
+            return ExitCode::from(EXIT_USAGE);
         }
+    };
+    match command {
+        Command::Help => {
+            print_help(&mut io::stdout());
+            ExitCode::from(EXIT_OK)
+        }
+        Command::Version => {
+            println!("earshot {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::from(EXIT_OK)
+        }
+        Command::Stream {
+            uri,
+            start_ms,
+            max_idle,
+        } => cmd_stream(&uri, start_ms, true, max_idle, &settings),
+        Command::Probe { uri, start_ms } => cmd_stream(&uri, start_ms, false, None, &settings),
+        Command::Pages { path } => cmd_pages(&path),
+        Command::ConfigInit => cmd_config_init(),
     }
 }
 
@@ -85,7 +88,7 @@ impl Command {
     ///
     /// Deliberately strict: a silently-ignored `--strat-ms` would produce a
     /// stream that starts in the wrong place and look like a bug in the splice.
-    fn parse(args: &[String]) -> Result<Command, String> {
+    fn parse(args: &[String]) -> Result<(Command, Settings), String> {
         let mut positional: Vec<&str> = Vec::new();
         let mut start_ms: Option<u64> = None;
         // Only set when the flag is actually given, so a default does not
@@ -97,8 +100,8 @@ impl Command {
         while index < args.len() {
             let arg = args[index].as_str();
             match arg {
-                "-h" | "--help" => return Ok(Command::Help),
-                "-V" | "--version" => return Ok(Command::Version),
+                "-h" | "--help" => return Ok((Command::Help, Settings::default())),
+                "-V" | "--version" => return Ok((Command::Version, Settings::default())),
                 "--start-ms" => {
                     let value = args
                         .get(index + 1)
@@ -152,25 +155,34 @@ impl Command {
         let max_idle = max_idle_flag.unwrap_or(settings.max_idle);
 
         match positional.as_slice() {
-            ["config", "init"] => Ok(Command::ConfigInit),
-            ["config"] if init => Ok(Command::ConfigInit),
+            ["config", "init"] => Ok((Command::ConfigInit, settings)),
+            ["config"] if init => Ok((Command::ConfigInit, settings)),
             ["config"] => Err("config needs --init".to_string()),
             _ if init => Err("--init is only valid for `earshot config`".to_string()),
-            [] => Ok(Command::Help),
-            ["pages", path] => Ok(Command::Pages {
-                path: (*path).to_string(),
-            }),
+            [] => Ok((Command::Help, settings)),
+            ["pages", path] => Ok((
+                Command::Pages {
+                    path: (*path).to_string(),
+                },
+                settings,
+            )),
             ["pages"] => Err("pages needs a file path".to_string()),
-            ["probe", uri] => Ok(Command::Probe {
-                uri: (*uri).to_string(),
-                start_ms,
-            }),
+            ["probe", uri] => Ok((
+                Command::Probe {
+                    uri: (*uri).to_string(),
+                    start_ms,
+                },
+                settings,
+            )),
             ["probe"] => Err("probe needs a URI".to_string()),
-            [uri] => Ok(Command::Stream {
-                uri: (*uri).to_string(),
-                start_ms,
-                max_idle,
-            }),
+            [uri] => Ok((
+                Command::Stream {
+                    uri: (*uri).to_string(),
+                    start_ms,
+                    max_idle,
+                },
+                settings,
+            )),
             _ => Err(format!(
                 "expected one URI, got {}: {}",
                 positional.len(),
@@ -197,7 +209,8 @@ OPTIONS:
 
 URIs:
     file://path, a bare path, http(s):// supported
-    room://                              not implemented yet
+    room:<track>  or  spotify:<track>      play through a listening room
+                                          (set room_host/room_token to use one)
 
 EXIT CODES:
     0 clean (including a closed pipe)   4 auth rejected
@@ -251,16 +264,18 @@ fn cmd_config_init() -> ExitCode {
     }
 }
 
-fn cmd_stream(uri: &str, start_ms: u64, write_audio: bool, max_idle: Option<Duration>) -> ExitCode {
-    let src = match source::open(uri) {
+fn cmd_stream(
+    uri: &str,
+    start_ms: u64,
+    write_audio: bool,
+    max_idle: Option<Duration>,
+    settings: &Settings,
+) -> ExitCode {
+    let src = match source::open(uri, settings) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("earshot: {uri}: {e}");
-            return ExitCode::from(match e.kind() {
-                io::ErrorKind::Unsupported => EXIT_USAGE,
-                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => EXIT_UNAVAILABLE,
-                _ => 2,
-            });
+            return ExitCode::from(e.exit_code());
         }
     };
 

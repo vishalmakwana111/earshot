@@ -497,13 +497,20 @@ fn exit_codes_follow_the_contract() {
     assert_eq!(earshot(&["pages"]).code, 1);
     assert_eq!(earshot(&["probe"]).code, 1);
     assert_eq!(earshot(&[good, good]).code, 1);
-    // room:// is still unimplemented, so it is a usage error.
+    // room:// with credentials in the URI is rejected as a usage error (room
+    // feature), and as unsupported without the room feature.
+    #[cfg(feature = "room")]
     assert_eq!(earshot(&["room://token@host/track"]).code, 1);
-    // http:// is implemented now, so an unreachable host is a *transport*
-    // failure worth retrying — not a usage error. Port 1 fails immediately;
-    // pointing this at a real hostname would make the suite depend on the
-    // network and take 30s to time out.
+    #[cfg(not(feature = "room"))]
+    assert_eq!(earshot(&["room://token@host/track"]).code, 1);
+    // http:// is implemented with the `http` feature, so an unreachable host is
+    // a *transport* failure worth retrying (2), otherwise it is unsupported (1).
+    // Port 1 fails immediately; pointing this at a real hostname would make the
+    // suite depend on the network and take 30s to time out.
+    #[cfg(feature = "http")]
     assert_eq!(earshot(&["http://127.0.0.1:1/a.ogg"]).code, 2);
+    #[cfg(not(feature = "http"))]
+    assert_eq!(earshot(&["http://127.0.0.1:1/a.ogg"]).code, 1);
 
     // 3 — permanently unavailable.
     assert_eq!(earshot(&["/definitely/not/here.ogg"]).code, 3);

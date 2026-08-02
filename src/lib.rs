@@ -6,7 +6,7 @@
 //! ## Layers
 //!
 //! ```text
-//! source   offset-addressed bytes         file:// today; http:// and room:// next
+//! source   offset-addressed bytes         file:// http(s):// today; room: next
 //!   │      Source { len, read_at }        transforms are Source→Source decorators
 //!   ▼
 //! ogg      page framing + checksums       genuinely codec-agnostic
@@ -30,6 +30,8 @@
 pub mod codec;
 pub mod config;
 pub mod ogg;
+#[cfg(feature = "room")]
+pub mod room;
 pub mod sink;
 pub mod source;
 pub mod splice;

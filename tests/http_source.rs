@@ -1,4 +1,6 @@
 //! `http://` end to end, against a fake upstream that reproduces the CDN quirks.
+#![cfg(feature = "http")]
+
 //!
 //! The server is hand-rolled on `std::net` rather than pulled in as a dependency,
 //! because the whole point is to control behaviour a real server will not perform

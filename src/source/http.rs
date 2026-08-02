@@ -94,14 +94,10 @@ impl HttpSource {
         // Status codes are data here, not errors: 206 vs 200 vs 416 each mean
         // something specific, and ureq would otherwise turn 4xx/5xx into an
         // error before it could be inspected.
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(settings.timeout_global))
-            .timeout_connect(Some(settings.timeout_connect))
-            .http_status_as_error(false)
-            .build();
+        let agent = super::http_agent(settings);
 
         Ok(HttpSource {
-            agent: config.into(),
+            agent,
             urls,
             active: 0,
             len: None,

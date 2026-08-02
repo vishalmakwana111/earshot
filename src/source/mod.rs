@@ -14,26 +14,109 @@
 //! decorators just decorate `Source` instead of `Read`:
 //!
 //! ```text
-//! Window<Decrypt<HttpRanged>>      // a Spotify track
+//! Window<Decrypt<HttpRanged>>      // a Spotify track in a room
 //!   Window   read_at(o) -> inner.read_at(o + 0xa7)   strips the prepended packet
 //!   Decrypt  read_at(o) -> keystream_at(o) ^ inner   exact, because CTR is seekable
 //! ```
 //!
-//! Because `Window` is offset-preserving, granule bisection still works straight
-//! through the stack, and the Ogg layer above never learns that any of it
-//! happened.
+//! Because the decorators are offset-preserving, granule bisection still works
+//! straight through the stack, and the Ogg layer above never learns that any of
+//! it happened.
 
 use std::io;
 
+#[cfg(feature = "room")]
+mod decrypt;
 mod file;
 #[cfg(feature = "http")]
 mod http;
 mod mem;
+mod window;
 
+#[cfg(feature = "room")]
+pub use decrypt::{Decrypt, SPOTIFY_AUDIO_IV};
 pub use file::FileSource;
 #[cfg(feature = "http")]
 pub use http::HttpSource;
 pub use mem::MemSource;
+pub use window::Window;
+
+/// How a URI failed to become a source, classified for the exit-code contract.
+///
+/// `DESIGN.md` Part 4 fixes the consumer surface: a player needs to tell "skip
+/// this track" from "retry" from "re-auth" from "you gave me junk". `io::Error`
+/// carries only a kind, and there is no kind for "the token was rejected", so
+/// routing through one would lose exactly the distinction the contract buys.
+#[derive(Debug)]
+pub enum OpenError {
+    /// A wrapped `io` failure from the plain backends; mapped to exit codes the
+    /// same way the CLI used to map `io::ErrorKind`.
+    Io(io::Error),
+    /// The URI or configuration is wrong — a room URI with no room configured,
+    /// for instance.
+    Usage(String),
+    /// Worth retrying: the room was busy, the network hiccup'd, a transient
+    /// resolve failure.
+    Transient(String),
+    /// Permanently not playable — wrong format, host decided the track is gone.
+    Unavailable(String),
+    /// Credentials were rejected: bad room token.
+    Auth(String),
+    /// The host (or file) handed back junk that passed no validation.
+    Malformed(String),
+}
+
+impl OpenError {
+    /// The exit code the CLI should report. 3 and 4 distinguish skip from re-auth,
+    /// which is what lets a consumer branch without parsing messages.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            OpenError::Io(e) => match e.kind() {
+                io::ErrorKind::Unsupported => 1,
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => 3,
+                _ => 2,
+            },
+            OpenError::Usage(_) => 1,
+            OpenError::Transient(_) => 2,
+            OpenError::Unavailable(_) => 3,
+            OpenError::Auth(_) => 4,
+            OpenError::Malformed(_) => 5,
+        }
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Io(e) => write!(f, "{e}"),
+            OpenError::Usage(m)
+            | OpenError::Transient(m)
+            | OpenError::Unavailable(m)
+            | OpenError::Auth(m)
+            | OpenError::Malformed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<io::Error> for OpenError {
+    fn from(e: io::Error) -> Self {
+        OpenError::Io(e)
+    }
+}
+
+/// A ureq agent with the network timeouts from `settings`, shared by the HTTP
+/// source and the room client so both talk the same retry language.
+#[cfg(feature = "http")]
+pub(crate) fn http_agent(settings: &crate::config::Settings) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(settings.timeout_global))
+        .timeout_connect(Some(settings.timeout_connect))
+        .http_status_as_error(false)
+        .build();
+    config.into()
+}
 
 /// A random-access window of bytes.
 pub trait Source {
@@ -90,42 +173,79 @@ pub fn read_upto_at<S: Source + ?Sized>(
 
 /// Resolve a URI to a source.
 ///
-/// At M1 only `file://` and bare paths resolve. `http(s)://` and `room://` are
-/// recognised so they can fail with something useful rather than being mistaken
-/// for a relative path.
-pub fn open(uri: &str) -> io::Result<Box<dyn Source>> {
+/// Recognised schemes: `file://` and bare paths, `http(s)://` (with the `http`
+/// feature), and — with the `room` feature — `spotify:` and `room:` track URIs,
+/// which play through the room configured in `settings`.
+#[cfg_attr(not(any(feature = "http", feature = "room")), allow(unused_variables))]
+pub fn open(uri: &str, settings: &crate::config::Settings) -> Result<Box<dyn Source>, OpenError> {
     if let Some(rest) = uri.strip_prefix("file://") {
-        return Ok(Box::new(FileSource::open(rest)?));
+        return FileSource::open(rest)
+            .map(|s| Box::new(s) as Box<dyn Source>)
+            .map_err(OpenError::Io);
     }
 
     #[cfg(feature = "http")]
     if uri.starts_with("http://") || uri.starts_with("https://") {
-        return Ok(Box::new(HttpSource::new(uri)?));
+        return HttpSource::with_fallbacks(vec![uri.to_string()], settings)
+            .map(|s| Box::new(s) as Box<dyn Source>)
+            .map_err(OpenError::Io);
     }
     #[cfg(not(feature = "http"))]
     for scheme in ["http://", "https://"] {
         if uri.starts_with(scheme) {
-            return Err(io::Error::new(
+            return Err(OpenError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("{scheme} needs the `http` feature"),
-            ));
+            )));
         }
     }
 
-    if uri.starts_with("room://") {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "room:// sources are not implemented yet (M2)",
-        ));
+    #[cfg(feature = "room")]
+    {
+        // The 0.1-style URI put the token in the URI itself. That is a real
+        // credential leak — argv, shell history, process listings — so it is
+        // rejected with a pointer to the config layers instead of tolerated.
+        if uri.starts_with("room://") {
+            return Err(OpenError::Usage(
+                "credentials do not belong in the URI — put the room's host and token \
+                 in room_host/room_token (or EARSHOT_ROOM_HOST/EARSHOT_ROOM_TOKEN) and \
+                 pass `room:<track>` or `spotify:<track>`"
+                    .into(),
+            ));
+        }
+        if uri == "room:" {
+            return Err(OpenError::Usage("room: needs a track URI after it".into()));
+        }
+        if let Some(track) = uri.strip_prefix("room:") {
+            return crate::room::open_room(track, settings);
+        }
+        // A bare `spotify:track:…` URI comes from a consumer that may not even
+        // know rooms exist (myx passes the URI straight through); if a room is
+        // configured, it is a room track.
+        if uri.starts_with("spotify:") && uri.len() > "spotify:".len() {
+            return crate::room::open_room(uri, settings);
+        }
     }
+    #[cfg(not(feature = "room"))]
+    {
+        if uri.starts_with("room:") || uri.starts_with("spotify:") {
+            return Err(OpenError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{uri:?} needs the `room` feature"),
+            )));
+        }
+    }
+
     if let Some((scheme, _)) = uri.split_once("://") {
-        return Err(io::Error::new(
+        return Err(OpenError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("unknown URI scheme {scheme:?}"),
-        ));
+        )));
     }
     // A bare path is a convenience, not a scheme.
-    Ok(Box::new(FileSource::open(uri)?))
+    FileSource::open(uri)
+        .map(|s| Box::new(s) as Box<dyn Source>)
+        .map_err(OpenError::Io)
 }
 
 impl<S: Source + ?Sized> Source for Box<S> {
@@ -196,21 +316,54 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_schemes_say_so_instead_of_looking_like_paths() {
-        // `Box<dyn Source>` is not `Debug`, so inspect the error by hand rather
-        // than through `unwrap_err`.
-        let kind = |uri: &str| match open(uri) {
-            Ok(_) => panic!("{uri} should not have opened"),
-            Err(e) => e.kind(),
-        };
-        assert_eq!(kind("room://tok@host/track"), io::ErrorKind::Unsupported);
-        // http:// now resolves to a source rather than being rejected. It is not
-        // contacted here — construction only validates the URL.
+    fn known_schemes_and_the_unknown_fallback() {
+        let settings = crate::config::Settings::default();
+        // file:// and bare paths are the plain case.
+        assert!(open("file:///does/not/exist.ogg", &settings).is_err());
+        assert!(open("/does/not/exist.ogg", &settings).is_err());
+        // http(s):// constructs a source without contacting it (M1 behaviour).
         #[cfg(feature = "http")]
         {
-            assert!(open("http://example.invalid/a.ogg").is_ok());
-            assert!(open("https://example.invalid/a.ogg").is_ok());
+            assert!(open("http://example.invalid/a.ogg", &settings).is_ok());
+            assert!(open("https://example.invalid/a.ogg", &settings).is_ok());
         }
-        assert_eq!(kind("gopher://x"), io::ErrorKind::Unsupported);
+        // Unknown schemes fail loudly instead of looking like relative paths.
+        let err = match open("gopher://x", &settings) {
+            Ok(_) => panic!("gopher:// should not open"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, OpenError::Io(ref e) if e.kind() == io::ErrorKind::Unsupported),
+            "{err}"
+        );
+
+        // With the room feature, room:// with credentials in the URI is a
+        // deliberate refusal — that is not the protocol's shape.
+        #[cfg(not(feature = "room"))]
+        {
+            let err = match open("room://tok@host/track", &settings) {
+                Ok(_) => panic!("room:// should not open"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, OpenError::Io(ref e) if e.kind() == io::ErrorKind::Unsupported),
+                "{err}"
+            );
+        }
+        // A spotify: URI with no room configured is a usage error, not a file.
+        #[cfg(feature = "room")]
+        {
+            for bad in [
+                "room://tok@host/spotify:track:x",
+                "spotify:track:xyz",
+                "room:",
+            ] {
+                let err = match open(bad, &settings) {
+                    Ok(_) => panic!("{bad} should not open"),
+                    Err(e) => e,
+                };
+                assert!(matches!(err, OpenError::Usage(_)), "{bad}: {err}");
+            }
+        }
     }
 }
