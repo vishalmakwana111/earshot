@@ -104,19 +104,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Linux only: shellcheck's verdict does not vary by host, so running it on
+      # one platform is enough — and the macOS runner has neither shellcheck nor
+      # apt-get.
       - name: Lint the installer
+        if: runner.os == 'Linux'
         run: |
-          if command -v shellcheck >/dev/null 2>&1; then
-            shellcheck install.sh
-          else
-            sudo apt-get update && sudo apt-get install -y shellcheck && shellcheck install.sh
-          fi
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck install.sh
 
       # It has to run under more than bash: the curl|sh idiom hands it to
       # whatever /bin/sh is, which on Debian is dash.
       - name: Check it parses under dash
         if: runner.os == 'Linux'
         run: sudo apt-get install -y dash && dash -n install.sh
+
+      - name: Check it parses under the host /bin/sh
+        run: sh -n install.sh
 
       - name: Package a release the way release.yml does
         run: |
