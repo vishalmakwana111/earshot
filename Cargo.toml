@@ -18,6 +18,7 @@ categories = ["command-line-utilities", "multimedia::audio"]
 #
 #   M1 (sources + pipeline) : ureq (ranged GETs, no tokio; reqwest/tokio skipped)
 #   M2 (room:// backend)    : aes, ctr, serde, serde_json, url  (+ ureq, via `http`)
+#   M3 (host subcommand)    : tiny_http, open, rand, sha2, base64
 #
 # Note on M2 vs the original plan: `librespot-core`/`librespot-audio` turned out
 # to be unnecessary for the guest. Resolution is pure HTTP against the room
@@ -40,11 +41,23 @@ serde_json = { version = "1", optional = true }
 # `url` is already in the tree via ureq; a direct dependency is what lets the
 # room client parse host URLs with a battle-tested parser at the trust boundary.
 url = { version = "2", optional = true }
+tiny_http = { version = "0.12", default-features = false, optional = true }
+rand = { version = "0.8", optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # Only used by tests to *encrypt* fake fixtures the room client then decrypts.
 aes = "0.8"
 ctr = "0.9"
+# The host e2e recomputes the CDN signature from the shared token, which is the
+# only way to prove a *correctly signed but expired* URL is refused — as opposed
+# to a forged one, which any wrong string would fail for the wrong reason.
+sha2 = "0.10"
+base64 = "0.22"
+# The TLS e2e mints its own certificate at test time. A checked-in fixture cert
+# would be a test that starts failing on a date nobody chose.
+rcgen = "0.13"
 
 [profile.release]
 lto = true
@@ -60,3 +73,19 @@ http = ["dep:ureq"]
 # The room:// backend — a strict protocol client plus the AES-CTR + window
 # decorators. Implies `http`: the room client talks HTTP.
 room = ["dep:aes", "dep:ctr", "dep:serde", "dep:serde_json", "dep:url", "http"]
+# The `host` — the other half of a room. This is the "wrap external engine"
+# shape (Part 8 #1 settled for M3): earshot owns the room server surface
+# (join/resolve/token + ranged CDN) and delegates the actual Spotify session to
+# an external engine it talks to over HTTP. Implies `room` (it mints the very
+# URLs the room client consumes).
+host = ["dep:tiny_http", "dep:rand", "dep:sha2", "dep:base64", "room"]
+# TLS for the room's control channel. Without it the shared token and the audio
+# key cross the network in the clear — the Spotify session never does, so this
+# is not about the account, but a room on anything wider than a trusted LAN
+# wants it. rustls is already in the tree via ureq, so the marginal cost is
+# `rustls-pemfile` and `zeroize`; the guest could already speak https.
+#
+# In the host rather than behind a reverse proxy because a room's whole appeal
+# is that the maintenance surface is one box, and "also run and renew nginx"
+# is a second one.
+tls = ["host", "tiny_http/ssl-rustls"]

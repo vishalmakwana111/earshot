@@ -61,6 +61,8 @@ fn main() -> ExitCode {
         Command::Probe { uri, start_ms } => cmd_stream(&uri, start_ms, false, None, &settings),
         Command::Pages { path } => cmd_pages(&path),
         Command::ConfigInit => cmd_config_init(),
+        #[cfg(feature = "host")]
+        Command::Host => cmd_host(&settings),
     }
 }
 
@@ -79,6 +81,9 @@ enum Command {
     },
     /// Write a commented config template, so there is a file to edit.
     ConfigInit,
+    /// (host feature) serve a listening room, M3 — see `earshot --help`.
+    #[cfg(feature = "host")]
+    Host,
     Help,
     Version,
 }
@@ -175,6 +180,10 @@ impl Command {
                 settings,
             )),
             ["probe"] => Err("probe needs a URI".to_string()),
+            #[cfg(feature = "host")]
+            ["host"] => Ok((Command::Host, settings)),
+            #[cfg(feature = "host")]
+            ["host", ..] => Err("host takes no arguments (see settings)".to_string()),
             [uri] => Ok((
                 Command::Stream {
                     uri: (*uri).to_string(),
@@ -202,6 +211,7 @@ USAGE:
     earshot probe <uri> [--start-ms N]  metadata JSON on stdout, no audio
     earshot pages <file>                page structure and checksum validation
     earshot config --init               write a commented config file
+    earshot host                        serve a listening room (host_bind/host_engine)
 
 OPTIONS:
     --start-ms N                        where to start
@@ -260,6 +270,17 @@ fn cmd_config_init() -> ExitCode {
         Err(e) => {
             eprintln!("earshot: {}: {e}", path.display());
             ExitCode::from(EXIT_USAGE)
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn cmd_host(settings: &Settings) -> ExitCode {
+    match earshot::room::host::run_host(settings) {
+        Ok(()) => ExitCode::from(EXIT_OK),
+        Err(e) => {
+            eprintln!("earshot: {e}");
+            ExitCode::from(e.exit_code())
         }
     }
 }

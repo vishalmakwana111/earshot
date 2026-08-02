@@ -24,6 +24,8 @@
 //! live in `source::decrypt` and here respectively.
 
 pub mod client;
+#[cfg(feature = "host")]
+pub mod host;
 
 use crate::config::Settings;
 use crate::source::{read_exact_at, Decrypt, HttpSource, OpenError, Source, Window};
@@ -59,11 +61,12 @@ pub fn open_room(track: &str, settings: &Settings) -> Result<Box<dyn Source>, Op
         )));
     }
 
-    let resolved = RoomClient::new(
+    let resolved = RoomClient::with_scheme(
         crate::source::http_agent(settings),
         host.to_string(),
         token.to_string(),
         settings.room_allow_networks.clone(),
+        settings.room_tls,
     )
     .resolve(track)?;
 
