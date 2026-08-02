@@ -98,8 +98,18 @@ jobs:
           fi
           echo "dependency tree is empty, as intended"
 
-      - name: Byte core builds and tests with no dependencies at all
-        run: cargo test --lib --no-default-features --offline
+      # A *build* of the byte core needs nothing, so it is still proved with no
+      # network at all. A `cargo test` cannot be, and that is not the property
+      # slipping: dev-dependencies are compiled for any test target regardless
+      # of features, and since M2 there are some — the room fixtures encrypt
+      # with aes/ctr, the host e2e signs with sha2 and mints certificates with
+      # rcgen. That is test scaffolding, not something the library pulls in,
+      # which is exactly the distinction `--edges normal` above draws.
+      - name: Byte core builds with no dependencies at all
+        run: cargo build --lib --no-default-features --offline
+
+      - name: Byte core tests pass with no features
+        run: cargo test --lib --no-default-features
 
   # The installer is the first thing a user runs, it is shell, and it is the one
   # component no Rust test covers. So CI packages a release exactly as
